@@ -388,8 +388,8 @@ If you are modifying the code, you can use the following figure to map the code 
 ### Experimental Poisson--Gamma hierarchy
 
 An optional two-scale model uses two low-resolution Poisson groups, four
-high-resolution Gamma groups, and a Gaussian reconstruction distribution while
-retaining the NVAE network hierarchy. See
+high-resolution Gamma groups, and the original dataset-default reconstruction
+distribution while retaining the NVAE network hierarchy. See
 [the design, literature review, limitations, and training command](docs/mixed_poisson_gamma_hvae.md).
 
 
