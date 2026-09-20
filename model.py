@@ -17,7 +17,7 @@ from neural_ar_operations import ELUConv as ARELUConv
 from torch.distributions.bernoulli import Bernoulli
 
 from utils import get_stride_for_cell_type, get_input_size, groups_per_scale
-from distributions import Normal, DiscMixLogistic, NormalDecoder
+from distributions import Normal, Poisson, Gamma, DiscMixLogistic, NormalDecoder
 from thirdparty.inplaced_sync_batchnorm import SyncBatchNormSwish
 
 CHANNEL_MULT = 2
@@ -111,6 +111,10 @@ class AutoEncoder(nn.Module):
         self.use_se = args.use_se
         self.res_dist = args.res_dist
         self.num_bits = args.num_x_bits
+        self.latent_distribution = getattr(args, 'latent_distribution', 'normal')
+        self.poisson_relaxation_temperature = getattr(args, 'poisson_relaxation_temperature', 0.1)
+        self.poisson_max_count = getattr(args, 'poisson_max_count', 64)
+        self.poisson_max_rate = getattr(args, 'poisson_max_rate', 30.)
 
         self.num_latent_scales = args.num_latent_scales         # number of spatial scales that latent layers will reside
         self.num_groups_per_scale = args.num_groups_per_scale   # number of groups of latent vars. per scale
@@ -118,6 +122,11 @@ class AutoEncoder(nn.Module):
         self.groups_per_scale = groups_per_scale(self.num_latent_scales, self.num_groups_per_scale, args.ada_groups,
                                                  minimum_groups=args.min_groups_per_scale)
 
+        if self.latent_distribution == 'mixed_poisson_gamma':
+            if self.groups_per_scale != [4, 2]:
+                raise ValueError('mixed_poisson_gamma requires two scales with encoder groups [4, 2]. '
+                                 'Use --num_latent_scales 2 --num_groups_per_scale 4 --ada_groups '
+                                 '--min_groups_per_scale 2.')
         self.vanilla_vae = self.num_latent_scales == 1 and self.num_groups_per_scale == 1
 
         # encoder parameteres
@@ -157,10 +166,12 @@ class AutoEncoder(nn.Module):
 
         self.with_nf = args.num_nf > 0
         self.num_flows = args.num_nf
+        if self.latent_distribution == 'mixed_poisson_gamma' and self.with_nf:
+            raise ValueError('Normalizing flows are only implemented for Normal latents; use --num_nf 0.')
 
         self.enc0 = self.init_encoder0(mult)
         self.enc_sampler, self.dec_sampler, self.nf_cells, self.enc_kv, self.dec_kv, self.query = \
-            self.init_normal_sampler(mult)
+            self.init_latent_sampler(mult)
 
         if self.vanilla_vae:
             self.dec_tower = []
@@ -253,12 +264,13 @@ class AutoEncoder(nn.Module):
             nn.ELU())
         return cell
 
-    def init_normal_sampler(self, mult):
+    def init_latent_sampler(self, mult):
         enc_sampler, dec_sampler, nf_cells = nn.ModuleList(), nn.ModuleList(), nn.ModuleList()
         enc_kv, dec_kv, query = nn.ModuleList(), nn.ModuleList(), nn.ModuleList()
         for s in range(self.num_latent_scales):
             for g in range(self.groups_per_scale[self.num_latent_scales - s - 1]):
-                # build mu, sigma generator for encoder
+                # Each head emits two tensors: Normal (mu, log_sigma),
+                # Gamma (log_shape, log_rate), or Poisson (log_rate, unused).
                 num_c = int(self.num_channels_enc * mult)
                 cell = Conv2D(num_c, 2 * self.num_latent_per_group, kernel_size=3, padding=1, bias=True)
                 enc_sampler.append(cell)
@@ -268,7 +280,7 @@ class AutoEncoder(nn.Module):
                     num_c1 = int(self.num_channels_enc * mult)
                     num_c2 = 8 * self.num_latent_per_group  # use 8x features
                     nf_cells.append(PairedCellAR(self.num_latent_per_group, num_c1, num_c2, arch))
-                if not (s == 0 and g == 0):  # for the first group, we use a fixed standard Normal.
+                if not (s == 0 and g == 0):  # The first group uses a fixed family-specific prior.
                     num_c = int(self.num_channels_dec * mult)
                     cell = nn.Sequential(
                         nn.ELU(),
@@ -336,6 +348,46 @@ class AutoEncoder(nn.Module):
         return nn.Sequential(nn.ELU(),
                              Conv2D(C_in, C_out, 3, padding=1, bias=True))
 
+    def _latent_kind(self, group_index):
+        if self.latent_distribution == 'normal':
+            return 'normal'
+        # Decoder order is low to high resolution for groups_per_scale [4, 2].
+        return 'poisson' if group_index < 2 else 'gamma'
+
+    def _latent_from_param(self, group_index, param, residual_param=None, temp=1.):
+        first, second = torch.chunk(param, 2, dim=1)
+        if residual_param is not None and self.res_dist:
+            residual_first, residual_second = torch.chunk(residual_param, 2, dim=1)
+            first = first + residual_first
+            second = second + residual_second
+
+        latent_kind = self._latent_kind(group_index)
+        if latent_kind == 'normal':
+            return Normal(first, second, temp=temp)
+        if latent_kind == 'poisson':
+            return Poisson(first,
+                           relaxation_temperature=self.poisson_relaxation_temperature,
+                           max_count=self.poisson_max_count,
+                           max_rate=self.poisson_max_rate)
+        return Gamma(first, second, temp=temp)
+
+    def _fixed_prior(self, group_index, reference, temp=1.):
+        zeros = torch.zeros_like(reference)
+        latent_kind = self._latent_kind(group_index)
+        if latent_kind == 'normal':
+            return Normal(zeros, zeros, temp=temp)
+        if latent_kind == 'poisson':
+            return Poisson(zeros,
+                           relaxation_temperature=self.poisson_relaxation_temperature,
+                           max_count=self.poisson_max_count,
+                           max_rate=self.poisson_max_rate)
+        return Gamma(zeros, zeros, temp=temp)
+
+    def _sample_latent(self, dist, relaxed_poisson=False):
+        if isinstance(dist, Poisson):
+            return dist.sample(relaxed=relaxed_poisson)
+        return dist.sample()
+
     def forward(self, x):
         s = self.stem(2 * x - 1.0)
 
@@ -360,9 +412,8 @@ class AutoEncoder(nn.Module):
         idx_dec = 0
         ftr = self.enc0(s)                            # this reduces the channel dimension
         param0 = self.enc_sampler[idx_dec](ftr)
-        mu_q, log_sig_q = torch.chunk(param0, 2, dim=1)
-        dist = Normal(mu_q, log_sig_q)   # for the first approx. posterior
-        z, _ = dist.sample()
+        dist = self._latent_from_param(idx_dec, param0)   # first approximate posterior
+        z, _ = self._sample_latent(dist, relaxed_poisson=self.training)
         log_q_conv = dist.log_p(z)
 
         # apply normalizing flows
@@ -378,7 +429,7 @@ class AutoEncoder(nn.Module):
         s = 0
 
         # prior for z0
-        dist = Normal(mu=torch.zeros_like(z), log_sigma=torch.zeros_like(z))
+        dist = self._fixed_prior(0, z)
         log_p_conv = dist.log_p(z)
         all_p = [dist]
         all_log_p = [log_p_conv]
@@ -392,14 +443,14 @@ class AutoEncoder(nn.Module):
                 if idx_dec > 0:
                     # form prior
                     param = self.dec_sampler[idx_dec - 1](s)
-                    mu_p, log_sig_p = torch.chunk(param, 2, dim=1)
+                    prior_param = param
+                    prior_dist = self._latent_from_param(idx_dec, prior_param)
 
                     # form encoder
                     ftr = combiner_cells_enc[idx_dec - 1](combiner_cells_s[idx_dec - 1], s)
                     param = self.enc_sampler[idx_dec](ftr)
-                    mu_q, log_sig_q = torch.chunk(param, 2, dim=1)
-                    dist = Normal(mu_p + mu_q, log_sig_p + log_sig_q) if self.res_dist else Normal(mu_q, log_sig_q)
-                    z, _ = dist.sample()
+                    dist = self._latent_from_param(idx_dec, param, residual_param=prior_param)
+                    z, _ = self._sample_latent(dist, relaxed_poisson=self.training)
                     log_q_conv = dist.log_p(z)
                     # apply NF
                     for n in range(self.num_flows):
@@ -410,7 +461,7 @@ class AutoEncoder(nn.Module):
                     all_q.append(dist)
 
                     # evaluate log_p(z)
-                    dist = Normal(mu_p, log_sig_p)
+                    dist = prior_dist
                     log_p_conv = dist.log_p(z)
                     all_p.append(dist)
                     all_log_p.append(log_p_conv)
@@ -449,8 +500,9 @@ class AutoEncoder(nn.Module):
     def sample(self, num_samples, t):
         scale_ind = 0
         z0_size = [num_samples] + self.z0_size
-        dist = Normal(mu=torch.zeros(z0_size).cuda(), log_sigma=torch.zeros(z0_size).cuda(), temp=t)
-        z, _ = dist.sample()
+        reference = torch.zeros(z0_size, device=self.prior_ftr0.device)
+        dist = self._fixed_prior(0, reference, temp=t)
+        z, _ = self._sample_latent(dist, relaxed_poisson=False)
 
         idx_dec = 0
         s = self.prior_ftr0.unsqueeze(0)
@@ -461,9 +513,8 @@ class AutoEncoder(nn.Module):
                 if idx_dec > 0:
                     # form prior
                     param = self.dec_sampler[idx_dec - 1](s)
-                    mu, log_sigma = torch.chunk(param, 2, dim=1)
-                    dist = Normal(mu, log_sigma, t)
-                    z, _ = dist.sample()
+                    dist = self._latent_from_param(idx_dec, param, temp=t)
+                    z, _ = self._sample_latent(dist, relaxed_poisson=False)
 
                 # 'combiner_dec'
                 s = cell(s, z)

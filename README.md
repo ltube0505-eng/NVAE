@@ -385,6 +385,13 @@ If you are modifying the code, you can use the following figure to map the code 
     <img src="img/model_diagram.png" width="900">
 </p>
 
+### Experimental Poisson--Gamma hierarchy
+
+An optional two-scale model uses two low-resolution Poisson groups, four
+high-resolution Gamma groups, and the original dataset-default reconstruction
+distribution while retaining the NVAE network hierarchy. See
+[the design, literature review, limitations, and training command](docs/mixed_poisson_gamma_hvae.md).
+
 
 ## Traversing the latent space
 We can generate images by traversing in the latent space of NVAE. This sequence is generated using our model

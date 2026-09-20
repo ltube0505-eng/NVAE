@@ -387,6 +387,16 @@ if __name__ == '__main__':
                         help='number of groups of latent variables per scale')
     parser.add_argument('--num_latent_per_group', type=int, default=20,
                         help='number of channels in latent variables per group')
+    parser.add_argument('--latent_distribution', type=str, default='normal',
+                        choices=['normal', 'mixed_poisson_gamma'],
+                        help='latent family; mixed mode uses 2 low-resolution Poisson groups and '
+                             '4 high-resolution Gamma groups')
+    parser.add_argument('--poisson_relaxation_temperature', type=float, default=0.1,
+                        help='sigmoid temperature for straight-through Poisson arrival indicators')
+    parser.add_argument('--poisson_max_count', type=int, default=64,
+                        help='number of exponential arrivals used by relaxed Poisson sampling')
+    parser.add_argument('--poisson_max_rate', type=float, default=30.,
+                        help='upper bound on Poisson rates to control count truncation')
     parser.add_argument('--ada_groups', action='store_true', default=False,
                         help='Settings this to true will set different number of groups per scale.')
     parser.add_argument('--min_groups_per_scale', type=int, default=1,
@@ -459,5 +469,3 @@ if __name__ == '__main__':
         print('starting in debug mode')
         args.distributed = True
         init_processes(0, size, main, args)
-
-

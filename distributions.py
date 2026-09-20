@@ -50,6 +50,85 @@ class Normal:
         return 0.5 * (term1 * term1 + term2 * term2) - 0.5 - torch.log(term2)
 
 
+class Poisson:
+    """Poisson latent with an analytic KL and a straight-through pathwise surrogate.
+
+    The relaxed sample represents a Poisson process as exponential inter-arrival
+    times. Its forward value is an integer count; its backward value uses a
+    sigmoid relaxation of the arrival-time indicators. Exact sampling is used
+    when ``relaxed`` is false.
+    """
+
+    def __init__(self, log_rate, relaxation_temperature=0.1, max_count=64, max_rate=30.):
+        if relaxation_temperature <= 0.:
+            raise ValueError('relaxation_temperature must be positive.')
+        if max_count < 1:
+            raise ValueError('max_count must be at least one.')
+        if max_rate <= 0.:
+            raise ValueError('max_rate must be positive.')
+        max_log_rate = float(np.log(max_rate))
+        self.log_rate = torch.clamp(soft_clamp5(log_rate), max=max_log_rate)
+        self.rate = torch.exp(self.log_rate) + 1e-4
+        self.relaxation_temperature = relaxation_temperature
+        self.max_count = max_count
+
+    def sample(self, relaxed=False):
+        if not relaxed:
+            return torch.poisson(self.rate), None
+
+        # A homogeneous Poisson count is the number of exponential arrival
+        # times before t=1. Truncation is controlled by max_count/max_rate.
+        exponential = torch.distributions.Exponential(self.rate)
+        inter_arrivals = exponential.rsample((self.max_count,))
+        arrival_times = torch.cumsum(inter_arrivals, dim=0)
+        hard_count = (arrival_times <= 1.).to(self.rate.dtype).sum(dim=0)
+        soft_count = torch.sigmoid(
+            (1. - arrival_times) / self.relaxation_temperature).sum(dim=0)
+        count = hard_count + soft_count - soft_count.detach()
+        return count, None
+
+    def log_p(self, samples):
+        samples = torch.clamp(samples, min=0.)
+        return samples * self.log_rate - self.rate - torch.lgamma(samples + 1.)
+
+    def kl(self, poisson_dist):
+        return self.rate * (self.log_rate - poisson_dist.log_rate) + \
+            poisson_dist.rate - self.rate
+
+
+class Gamma:
+    """Gamma latent parameterized by unconstrained log-shape/log-rate tensors."""
+
+    def __init__(self, log_shape, log_rate, temp=1.):
+        if temp <= 0.:
+            raise ValueError('temp must be positive.')
+        self.log_shape = soft_clamp5(log_shape)
+        self.log_rate = soft_clamp5(log_rate)
+        self.shape = torch.exp(self.log_shape) + 1e-4
+        self.rate = torch.exp(self.log_rate) + 1e-4
+        if temp != 1.:
+            # Preserve the mean while scaling variance by ``temp``.
+            self.shape = self.shape / temp
+            self.rate = self.rate / temp
+            self.log_shape = torch.log(self.shape)
+            self.log_rate = torch.log(self.rate)
+
+    def sample(self):
+        z = torch.distributions.Gamma(self.shape, self.rate).rsample()
+        return z, None
+
+    def log_p(self, samples):
+        samples = torch.clamp(samples, min=1e-8)
+        return self.shape * self.log_rate - torch.lgamma(self.shape) + \
+            (self.shape - 1.) * torch.log(samples) - self.rate * samples
+
+    def kl(self, gamma_dist):
+        return gamma_dist.shape * (self.log_rate - gamma_dist.log_rate) - \
+            torch.lgamma(self.shape) + torch.lgamma(gamma_dist.shape) + \
+            (self.shape - gamma_dist.shape) * torch.digamma(self.shape) + \
+            self.shape * (gamma_dist.rate / self.rate - 1.)
+
+
 class NormalDecoder:
     def __init__(self, param, num_bits=8):
         B, C, H, W = param.size()
@@ -221,4 +300,3 @@ class DiscMixLogistic:
         x = torch.cat([x0, x1, x2], 1)
         x = x / 2. + 0.5
         return x
-
