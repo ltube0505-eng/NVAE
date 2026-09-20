@@ -110,12 +110,6 @@ class AutoEncoder(nn.Module):
         self.crop_output = self.dataset in {'mnist', 'omniglot', 'stacked_mnist'}
         self.use_se = args.use_se
         self.res_dist = args.res_dist
-        # Keep the original NVAE inference path as the default. Older checkpoints do not
-        # contain this argument, hence getattr instead of direct attribute access.
-        self.dual_decoder_paths = getattr(args, 'dual_decoder_paths', False)
-        if self.dual_decoder_paths and not self.res_dist:
-            raise ValueError('--dual_decoder_paths requires --res_dist because the posterior head predicts corrections '
-                             'to the conditional-prior parameters.')
         self.num_bits = args.num_x_bits
 
         self.num_latent_scales = args.num_latent_scales         # number of spatial scales that latent layers will reside
@@ -170,10 +164,9 @@ class AutoEncoder(nn.Module):
 
         if self.vanilla_vae:
             self.dec_tower = []
-            self.posterior_dec_combiners = nn.ModuleList()
             self.stem_decoder = Conv2D(self.num_latent_per_group, mult * self.num_channels_enc, (1, 1), bias=True)
         else:
-            self.dec_tower, self.posterior_dec_combiners, mult = self.init_decoder_tower(mult)
+            self.dec_tower, mult = self.init_decoder_tower(mult)
 
         self.post_process, mult = self.init_post_process(mult)
 
@@ -287,11 +280,8 @@ class AutoEncoder(nn.Module):
         return enc_sampler, dec_sampler, nf_cells, enc_kv, dec_kv, query
 
     def init_decoder_tower(self, mult):
-        # Create the generative/prior tower. In dual-path mode the ordinary
-        # decoder cells in this tower are reused by both paths, while each path
-        # has its own latent combiner.
+        # create decoder tower
         dec_tower = nn.ModuleList()
-        posterior_dec_combiners = nn.ModuleList()
         for s in range(self.num_latent_scales):
             for g in range(self.groups_per_scale[self.num_latent_scales - s - 1]):
                 num_c = int(self.num_channels_dec * mult)
@@ -303,10 +293,6 @@ class AutoEncoder(nn.Module):
 
                 cell = DecCombinerCell(num_c, self.num_latent_per_group, num_c, cell_type='combiner_dec')
                 dec_tower.append(cell)
-                if self.dual_decoder_paths:
-                    posterior_dec_combiners.append(
-                        DecCombinerCell(num_c, self.num_latent_per_group, num_c,
-                                       cell_type='combiner_dec_posterior'))
 
             # down cells after finishing a scale
             if s < self.num_latent_scales - 1:
@@ -317,7 +303,7 @@ class AutoEncoder(nn.Module):
                 dec_tower.append(cell)
                 mult = mult / CHANNEL_MULT
 
-        return dec_tower, posterior_dec_combiners, mult
+        return dec_tower, mult
 
     def init_post_process(self, mult):
         post_process = nn.ModuleList()
@@ -375,126 +361,68 @@ class AutoEncoder(nn.Module):
         ftr = self.enc0(s)                            # this reduces the channel dimension
         param0 = self.enc_sampler[idx_dec](ftr)
         mu_q, log_sig_q = torch.chunk(param0, 2, dim=1)
-        q_dist = Normal(mu_q, log_sig_q)   # for the first approx. posterior
-        z_posterior, _ = q_dist.sample()
-        log_q_conv = q_dist.log_p(z_posterior)
+        dist = Normal(mu_q, log_sig_q)   # for the first approx. posterior
+        z, _ = dist.sample()
+        log_q_conv = dist.log_p(z)
 
         # apply normalizing flows
         nf_offset = 0
         for n in range(self.num_flows):
-            z_posterior, log_det = self.nf_cells[n](z_posterior, ftr)
+            z, log_det = self.nf_cells[n](z, ftr)
             log_q_conv -= log_det
         nf_offset += self.num_flows
-        all_q = [q_dist]
+        all_q = [dist]
         all_log_q = [log_q_conv]
 
+        # To make sure we do not pass any deterministic features from x to decoder.
+        s = 0
+
         # prior for z0
-        p_dist = Normal(mu=torch.zeros_like(z_posterior), log_sigma=torch.zeros_like(z_posterior))
-        log_p_conv = p_dist.log_p(z_posterior)
-        all_p = [p_dist]
+        dist = Normal(mu=torch.zeros_like(z), log_sigma=torch.zeros_like(z))
+        log_p_conv = dist.log_p(z)
+        all_p = [dist]
         all_log_p = [log_p_conv]
 
         idx_dec = 0
-        initial_s = self.prior_ftr0.unsqueeze(0)
-        batch_size = z_posterior.size(0)
-        initial_s = initial_s.expand(batch_size, -1, -1, -1)
+        s = self.prior_ftr0.unsqueeze(0)
+        batch_size = z.size(0)
+        s = s.expand(batch_size, -1, -1, -1)
+        for cell in self.dec_tower:
+            if cell.cell_type == 'combiner_dec':
+                if idx_dec > 0:
+                    # form prior
+                    param = self.dec_sampler[idx_dec - 1](s)
+                    mu_p, log_sig_p = torch.chunk(param, 2, dim=1)
 
-        if self.dual_decoder_paths:
-            # The two tensors start from the same learned seed but are separate
-            # feature states. They diverge as soon as z_prior and z_posterior are
-            # injected by their branch-specific decoder combiners.
-            prior_s = initial_s
-            posterior_s = initial_s.clone()
-            z_prior, _ = p_dist.sample()
+                    # form encoder
+                    ftr = combiner_cells_enc[idx_dec - 1](combiner_cells_s[idx_dec - 1], s)
+                    param = self.enc_sampler[idx_dec](ftr)
+                    mu_q, log_sig_q = torch.chunk(param, 2, dim=1)
+                    dist = Normal(mu_p + mu_q, log_sig_p + log_sig_q) if self.res_dist else Normal(mu_q, log_sig_q)
+                    z, _ = dist.sample()
+                    log_q_conv = dist.log_p(z)
+                    # apply NF
+                    for n in range(self.num_flows):
+                        z, log_det = self.nf_cells[nf_offset + n](z, ftr)
+                        log_q_conv -= log_det
+                    nf_offset += self.num_flows
+                    all_log_q.append(log_q_conv)
+                    all_q.append(dist)
 
-            for cell in self.dec_tower:
-                if cell.cell_type == 'combiner_dec':
-                    if idx_dec > 0:
-                        # The conditional prior is parameterized only by the
-                        # independently propagated generative feature state.
-                        param = self.dec_sampler[idx_dec - 1](prior_s)
-                        mu_p, log_sig_p = torch.chunk(param, 2, dim=1)
-                        p_dist = Normal(mu_p, log_sig_p)
-                        z_prior, _ = p_dist.sample()
+                    # evaluate log_p(z)
+                    dist = Normal(mu_p, log_sig_p)
+                    log_p_conv = dist.log_p(z)
+                    all_p.append(dist)
+                    all_log_p.append(log_p_conv)
 
-                        # The correction head sees image evidence and the separate
-                        # posterior top-down state. Residual parameterization keeps
-                        # a partial dependence on the conditional-prior parameters.
-                        ftr = combiner_cells_enc[idx_dec - 1](combiner_cells_s[idx_dec - 1], posterior_s)
-                        param = self.enc_sampler[idx_dec](ftr)
-                        delta_mu_q, delta_log_sig_q = torch.chunk(param, 2, dim=1)
-                        q_dist = Normal(mu_p + delta_mu_q, log_sig_p + delta_log_sig_q)
-                        z_posterior, _ = q_dist.sample()
-                        log_q_conv = q_dist.log_p(z_posterior)
-
-                        # Normalizing flows belong to the posterior path only.
-                        for n in range(self.num_flows):
-                            z_posterior, log_det = self.nf_cells[nf_offset + n](z_posterior, ftr)
-                            log_q_conv -= log_det
-                        nf_offset += self.num_flows
-                        all_log_q.append(log_q_conv)
-                        all_q.append(q_dist)
-
-                        # The KL/log-weight comparison is evaluated at the
-                        # posterior sample. z_prior is used only to advance the
-                        # independent generative state.
-                        log_p_conv = p_dist.log_p(z_posterior)
-                        all_p.append(p_dist)
-                        all_log_p.append(log_p_conv)
-
-                    prior_s = cell(prior_s, z_prior)
-                    posterior_s = self.posterior_dec_combiners[idx_dec](posterior_s, z_posterior)
-                    idx_dec += 1
-                else:
-                    # Calling the same module on both tensors provides exact
-                    # parameter sharing without sharing the feature values.
-                    prior_s = cell(prior_s)
-                    posterior_s = cell(posterior_s)
-
-            # Reconstruction must use the posterior trajectory.
-            s = posterior_s
-        else:
-            # Original NVAE path: one decoder state is advanced by posterior
-            # samples during inference and by prior samples in sample().
-            s = initial_s
-            z = z_posterior
-            for cell in self.dec_tower:
-                if cell.cell_type == 'combiner_dec':
-                    if idx_dec > 0:
-                        # form prior
-                        param = self.dec_sampler[idx_dec - 1](s)
-                        mu_p, log_sig_p = torch.chunk(param, 2, dim=1)
-
-                        # form encoder
-                        ftr = combiner_cells_enc[idx_dec - 1](combiner_cells_s[idx_dec - 1], s)
-                        param = self.enc_sampler[idx_dec](ftr)
-                        mu_q, log_sig_q = torch.chunk(param, 2, dim=1)
-                        q_dist = Normal(mu_p + mu_q, log_sig_p + log_sig_q) if self.res_dist \
-                            else Normal(mu_q, log_sig_q)
-                        z, _ = q_dist.sample()
-                        log_q_conv = q_dist.log_p(z)
-                        # apply NF
-                        for n in range(self.num_flows):
-                            z, log_det = self.nf_cells[nf_offset + n](z, ftr)
-                            log_q_conv -= log_det
-                        nf_offset += self.num_flows
-                        all_log_q.append(log_q_conv)
-                        all_q.append(q_dist)
-
-                        # evaluate log_p(z)
-                        p_dist = Normal(mu_p, log_sig_p)
-                        log_p_conv = p_dist.log_p(z)
-                        all_p.append(p_dist)
-                        all_log_p.append(log_p_conv)
-
-                    # 'combiner_dec'
-                    s = cell(s, z)
-                    idx_dec += 1
-                else:
-                    s = cell(s)
+                # 'combiner_dec'
+                s = cell(s, z)
+                idx_dec += 1
+            else:
+                s = cell(s)
 
         if self.vanilla_vae:
-            s = self.stem_decoder(z_posterior)
+            s = self.stem_decoder(z)
 
         for cell in self.post_process:
             s = cell(s)
@@ -521,9 +449,7 @@ class AutoEncoder(nn.Module):
     def sample(self, num_samples, t):
         scale_ind = 0
         z0_size = [num_samples] + self.z0_size
-        device = self.prior_ftr0.device
-        dist = Normal(mu=torch.zeros(z0_size, device=device),
-                      log_sigma=torch.zeros(z0_size, device=device), temp=t)
+        dist = Normal(mu=torch.zeros(z0_size).cuda(), log_sigma=torch.zeros(z0_size).cuda(), temp=t)
         z, _ = dist.sample()
 
         idx_dec = 0
