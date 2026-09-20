@@ -385,14 +385,6 @@ If you are modifying the code, you can use the following figure to map the code 
     <img src="img/model_diagram.png" width="900">
 </p>
 
-### Experimental dual decoder feature paths
-
-The optional `--dual_decoder_paths` mode propagates separate conditional-prior and posterior decoder feature
-states. Ordinary decoder cells share parameters across the two paths, while the latent samples and decoder
-combiners are path-specific. This mode requires `--res_dist`. See
-[docs/dual_decoder_paths.md](docs/dual_decoder_paths.md) for the exact computation graph, training objective,
-and the distinction from the standard hierarchical ELBO.
-
 
 ## Traversing the latent space
 We can generate images by traversing in the latent space of NVAE. This sequence is generated using our model

@@ -415,10 +415,7 @@ if __name__ == '__main__':
     parser.add_argument('--use_se', action='store_true', default=False,
                         help='This flag enables squeeze and excitation.')
     parser.add_argument('--res_dist', action='store_true', default=False,
-                        help='This flag enables residual posterior parameterization.')
-    parser.add_argument('--dual_decoder_paths', action='store_true', default=False,
-                        help='Use separate prior/posterior decoder feature paths with shared ordinary decoder cells. '
-                             'Requires --res_dist.')
+                        help='This flag enables squeeze and excitation.')
     parser.add_argument('--cont_training', action='store_true', default=False,
                         help='This flag enables training from an existing checkpoint.')
     # DDP.
@@ -462,4 +459,5 @@ if __name__ == '__main__':
         print('starting in debug mode')
         args.distributed = True
         init_processes(0, size, main, args)
+
 
