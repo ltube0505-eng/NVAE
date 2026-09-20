@@ -391,9 +391,6 @@ if __name__ == '__main__':
                         choices=['normal', 'mixed_poisson_gamma'],
                         help='latent family; mixed mode uses 2 low-resolution Poisson groups and '
                              '4 high-resolution Gamma groups')
-    parser.add_argument('--reconstruction_distribution', type=str, default='dataset_default',
-                        choices=['dataset_default', 'gaussian'],
-                        help='observation model; mixed_poisson_gamma requires gaussian')
     parser.add_argument('--poisson_relaxation_temperature', type=float, default=0.1,
                         help='sigmoid temperature for straight-through Poisson arrival indicators')
     parser.add_argument('--poisson_max_count', type=int, default=64,
@@ -472,4 +469,3 @@ if __name__ == '__main__':
         print('starting in debug mode')
         args.distributed = True
         init_processes(0, size, main, args)
-
