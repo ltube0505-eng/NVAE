@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import torch
+from torch.distributions.bernoulli import Bernoulli
 
 from model import AutoEncoder
 import utils
@@ -13,7 +14,6 @@ def _args():
         res_dist=True,
         num_x_bits=8,
         latent_distribution='mixed_poisson_gamma',
-        reconstruction_distribution='gaussian',
         poisson_relaxation_temperature=0.2,
         poisson_max_count=32,
         poisson_max_rate=10.,
@@ -45,7 +45,7 @@ def _model():
     return model
 
 
-def test_group_mapping_and_gaussian_head():
+def test_group_mapping_and_dataset_default_head():
     model = _model()
     assert model.groups_per_scale == [4, 2]
     assert [model._latent_kind(i) for i in range(6)] == [
@@ -53,7 +53,9 @@ def test_group_mapping_and_gaussian_head():
 
     model.train()
     logits, log_q, log_p, kl_all, kl_diag = model(torch.rand(2, 1, 32, 32))
-    assert tuple(logits.shape) == (2, 2, 32, 32)
+    # MNIST keeps the original one-logit Bernoulli reconstruction head.
+    assert tuple(logits.shape) == (2, 1, 32, 32)
+    assert isinstance(model.decoder_output(logits), Bernoulli)
     assert tuple(log_q.shape) == (2,)
     assert tuple(log_p.shape) == (2,)
     assert len(kl_all) == 6
@@ -65,5 +67,5 @@ def test_exact_prior_sampling_path():
     model = _model().eval()
     with torch.no_grad():
         logits = model.sample(num_samples=2, t=1.)
-    assert tuple(logits.shape) == (2, 2, 32, 32)
+    assert tuple(logits.shape) == (2, 1, 32, 32)
     assert torch.isfinite(logits).all()
