@@ -10,6 +10,13 @@
 
 不过，这不是“把 Normal 类名替换掉”即可得到的严格等价 NVAE。Poisson 是离散分布，没有普通 Gaussian VAE 使用的精确路径重参数化；已有的 [Overdispersed BBVI](https://arxiv.org/abs/1603.01140) 工作也专门指出并缓解了 Poisson 深层指数族模型的随机梯度高方差问题。本实现因此应视作保留 NVAE 网络骨架的实验性混合指数族 HVAE。
 
+## 本次 reconstruction 修正
+
+- 混合模式只改变六个 latent groups 的概率分布，不改变 $p_\theta(x\mid z)$ 的选择规则。
+- 删除强制 Gaussian reconstruction 的配置项与模型分支。
+- `init_image_conditional()` 和 `decoder_output()` 恢复为与 `master` 相同的 dataset-default 实现。
+- 这样比较原版 NVAE 与混合 Poisson–Gamma 模型时，观测似然保持一致，性能差异主要来自 latent family 与相应梯度估计器。
+
 ## 模型定义
 
 保持 NVAE 原有的单一 top-down 路径、encoder/decoder cells、combiner、KL balancing、谱正则和训练流程不变。使用两个 latent scales，共六个 group；encoder 中的 scale 顺序为高到低 `[4, 2]`，decoder / 生成顺序为低到高 `[2, 4]`。
@@ -27,11 +34,17 @@ p_\theta(x,z_{1:6})
 \prod_{i=2}^{6}p_\theta(z_i\mid z_{<i}),
 $$
 
-其中 $p(z_1)=\operatorname{Poisson}(1)$，group 1 的条件先验仍为 Poisson，groups 2–5 的条件先验为 Gamma。后验保持 NVAE 的 top-down 条件形式 $q_\phi(z_i\mid x,z_{<i})$，并在同一祖先样本路径上计算条件 KL。观测模型统一为
+其中 $p(z_1)=\operatorname{Poisson}(1)$，group 1 的条件先验仍为 Poisson，groups 2–5 的条件先验为 Gamma。后验保持 NVAE 的 top-down 条件形式 $q_\phi(z_i\mid x,z_{<i})$，并在同一祖先样本路径上计算条件 KL。
 
-$$
-p_\theta(x\mid z_{1:6})=\mathcal N(\mu_\theta(z),\sigma_\theta^2(z)).
-$$
+重建分布完全沿用原版 NVAE 的 dataset-default 规则，不因混合 latent 模式而改变：
+
+| 数据集/配置 | Reconstruction distribution | 输出通道 |
+|---|---|---:|
+| MNIST、Omniglot | Bernoulli | 1 |
+| 彩色图像且 `num_mixture_dec=1` | NormalDecoder | 6 |
+| 彩色图像且 `num_mixture_dec>1` | Discretized mixture of logistics | `10 * num_mixture_dec` |
+
+因此默认彩色图像配置仍使用原 NVAE 的 discretized mixture of logistics，MNIST/Omniglot 仍使用 Bernoulli；没有用连续 Gaussian 密度替换离散像素似然。
 
 训练目标仍是负 ELBO（外加原 NVAE 正则项）：
 
@@ -74,7 +87,7 @@ Gamma 使用 shape/rate 参数化，采样调用 PyTorch `Gamma.rsample()` 的�
 4. **计数可能爆炸或塌缩为零。** 本实现限制 rate，并应持续监控每组 rate、零比例、最大 count 与 KL；rate clipping 本身也会造成边界梯度饱和。
 5. **非负 latent 改变 decoder 输入统计。** 原 NVAE 针对近似零均值 Gaussian latent 调优。网络结构虽然未变，学习率、KL warm-up、batch norm 统计和初始化可能需要重新搜索。
 6. **Normalizing flow 不兼容。** 原代码的 flow 是为 Normal base distribution 编写的；混合模式会拒绝 `num_nf > 0`，否则先验/后验将不再是用户指定的 Poisson/Gamma。
-7. **似然口径改变。** Gaussian reconstruction 与原版彩色图像常用的 discretized mixture of logistics 不可直接比较 bits-per-dimension；对整数像素，Gaussian 还是连续密度而非离散质量。
+7. **跨数据集的似然仍不可混比。** 本实现恢复了原版 NVAE 的 dataset-default reconstruction，因此同一数据集、同一 `num_mixture_dec` 配置下的 bpd/NLL 口径与原版一致；但 Bernoulli、NormalDecoder 与 discretized mixture of logistics 之间仍是不同的观测模型。
 
 ## 使用方法
 
@@ -82,7 +95,6 @@ Gamma 使用 shape/rate 参数化，采样调用 PyTorch `Gamma.rsample()` 的�
 python train.py \
   --dataset cifar10 \
   --latent_distribution mixed_poisson_gamma \
-  --reconstruction_distribution gaussian \
   --num_latent_scales 2 \
   --num_groups_per_scale 4 \
   --ada_groups \
@@ -94,7 +106,7 @@ python train.py \
   --poisson_max_count 64
 ```
 
-混合模式会校验 group 配置、Gaussian reconstruction 以及 `num_nf=0`，避免静默训练成与设计不同的模型。原版 NVAE 的默认参数仍使用 Normal latents 和 dataset-default reconstruction，因此已有命令与 checkpoint 保持兼容。
+混合模式只校验 group 配置以及 `num_nf=0`，不会覆盖 reconstruction。原版 NVAE 与混合 latent 模式都通过相同的 dataset-default 分支选择 Bernoulli、NormalDecoder 或 discretized mixture of logistics，因此可以在保持观测模型一致的前提下比较 latent family。
 
 ## 建议实验
 
