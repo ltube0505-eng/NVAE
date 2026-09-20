@@ -112,7 +112,6 @@ class AutoEncoder(nn.Module):
         self.res_dist = args.res_dist
         self.num_bits = args.num_x_bits
         self.latent_distribution = getattr(args, 'latent_distribution', 'normal')
-        self.reconstruction_distribution = getattr(args, 'reconstruction_distribution', 'dataset_default')
         self.poisson_relaxation_temperature = getattr(args, 'poisson_relaxation_temperature', 0.1)
         self.poisson_max_count = getattr(args, 'poisson_max_count', 64)
         self.poisson_max_rate = getattr(args, 'poisson_max_rate', 30.)
@@ -128,9 +127,6 @@ class AutoEncoder(nn.Module):
                 raise ValueError('mixed_poisson_gamma requires two scales with encoder groups [4, 2]. '
                                  'Use --num_latent_scales 2 --num_groups_per_scale 4 --ada_groups '
                                  '--min_groups_per_scale 2.')
-            if self.reconstruction_distribution != 'gaussian':
-                raise ValueError('mixed_poisson_gamma requires --reconstruction_distribution gaussian.')
-
         self.vanilla_vae = self.num_latent_scales == 1 and self.num_groups_per_scale == 1
 
         # encoder parameteres
@@ -342,10 +338,7 @@ class AutoEncoder(nn.Module):
 
     def init_image_conditional(self, mult):
         C_in = int(self.num_channels_dec * mult)
-        if self.reconstruction_distribution == 'gaussian':
-            num_image_channels = 1 if self.dataset in {'mnist', 'omniglot'} else 3
-            C_out = 2 * num_image_channels
-        elif self.dataset in {'mnist', 'omniglot'}:
+        if self.dataset in {'mnist', 'omniglot'}:
             C_out = 1
         else:
             if self.num_mix_output == 1:
@@ -541,8 +534,6 @@ class AutoEncoder(nn.Module):
         return logits
 
     def decoder_output(self, logits):
-        if self.reconstruction_distribution == 'gaussian':
-            return NormalDecoder(logits, num_bits=self.num_bits)
         if self.dataset in {'mnist', 'omniglot'}:
             return Bernoulli(logits=logits)
         elif self.dataset in {'stacked_mnist', 'cifar10', 'celeba_64', 'celeba_256', 'imagenet_32', 'imagenet_64', 'ffhq',
