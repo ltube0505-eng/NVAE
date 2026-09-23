@@ -18,6 +18,37 @@ def test_relaxed_poisson_has_integer_forward_values_and_finite_gradients():
     assert torch.isfinite(log_rate_q.grad).all()
 
 
+def test_continuous_relaxation_and_straight_through_are_distinct():
+    torch.manual_seed(13)
+    log_rate = torch.zeros(4, 8, requires_grad=True)
+    q = Poisson(log_rate, relaxation_temperature=0.4, max_count=32, max_rate=10.)
+
+    relaxed, _ = q.sample(estimator='relaxed')
+    straight_through, _ = q.sample(estimator='straight_through')
+
+    assert not torch.equal(relaxed.detach(), relaxed.detach().round())
+    assert torch.equal(straight_through.detach(), straight_through.detach().round())
+    (relaxed.mean() + straight_through.mean()).backward()
+    assert torch.isfinite(log_rate.grad).all()
+
+
+def test_obbvi_poisson_proposal_and_importance_identity():
+    q = Poisson(torch.tensor([0.2]).log(), max_rate=30.)
+    taus = (1., 3.)
+    counts = torch.arange(0., 40.)
+
+    log_q = q.log_p(counts)
+    log_mixture = q.proposal_mixture_log_p(counts, taus)
+    mixture = torch.exp(log_mixture)
+    weights = torch.exp(log_q - log_mixture)
+
+    # Because tau=1 is one of two mixture components, q/m <= 2.
+    assert torch.max(weights) <= 2. + 1e-6
+    # E_m[(q/m) z] = E_q[z] = rate (up to negligible tail truncation).
+    estimate = torch.sum(mixture * weights * counts)
+    assert torch.allclose(estimate, q.rate.squeeze(), atol=1e-5, rtol=1e-5)
+
+
 def test_poisson_analytic_kl_matches_torch():
     log_rate_q = torch.tensor([[-0.7, 0.2, 1.1]])
     log_rate_p = torch.tensor([[0.4, -0.3, 0.8]])

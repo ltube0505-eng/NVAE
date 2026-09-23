@@ -115,6 +115,38 @@ class AutoEncoder(nn.Module):
         self.poisson_relaxation_temperature = getattr(args, 'poisson_relaxation_temperature', 0.1)
         self.poisson_max_count = getattr(args, 'poisson_max_count', 64)
         self.poisson_max_rate = getattr(args, 'poisson_max_rate', 30.)
+        self.poisson_gradient_estimator = getattr(
+            args, 'poisson_gradient_estimator', 'straight_through')
+        valid_estimators = {'relaxed', 'reinforce', 'obbvi', 'straight_through'}
+        if self.poisson_gradient_estimator not in valid_estimators:
+            raise ValueError('Unknown Poisson gradient estimator: %s' %
+                             self.poisson_gradient_estimator)
+        obbvi_taus = getattr(args, 'obbvi_taus', '1.0,3.0')
+        if isinstance(obbvi_taus, str):
+            obbvi_taus = [float(tau.strip()) for tau in obbvi_taus.split(',') if tau.strip()]
+        self.obbvi_taus = tuple(float(tau) for tau in obbvi_taus)
+        if not self.obbvi_taus or any(tau < 1. for tau in self.obbvi_taus):
+            raise ValueError('O-BBVI dispersions must be a non-empty list with tau >= 1.')
+        if self.poisson_gradient_estimator == 'obbvi' and \
+                not any(abs(tau - 1.) < 1e-8 for tau in self.obbvi_taus):
+            raise ValueError('O-BBVI mixture must include tau=1 to bound importance weights.')
+        if self.poisson_gradient_estimator in {'reinforce', 'obbvi'} and \
+                self.latent_distribution != 'poisson':
+            raise ValueError('%s requires --latent_distribution poisson.' %
+                             self.poisson_gradient_estimator)
+        self.score_baseline_decay = getattr(args, 'score_baseline_decay', 0.9)
+        if not 0. <= self.score_baseline_decay < 1.:
+            raise ValueError('score_baseline_decay must be in [0, 1).')
+        self.reinforce_num_samples = int(getattr(args, 'reinforce_num_samples', 1))
+        self.obbvi_num_samples = int(getattr(args, 'obbvi_num_samples', 8))
+        if self.reinforce_num_samples < 1 or self.obbvi_num_samples < 1:
+            raise ValueError('Gradient-estimator sample counts must be positive.')
+        if self.poisson_gradient_estimator == 'obbvi' and \
+                self.obbvi_num_samples % len(self.obbvi_taus) != 0:
+            raise ValueError('--obbvi_num_samples must be divisible by the number of --obbvi_taus.')
+        self._score_baseline_value = None
+        self._obbvi_component = 0
+        self._gradient_context = None
 
         self.num_latent_scales = args.num_latent_scales         # number of spatial scales that latent layers will reside
         self.num_groups_per_scale = args.num_groups_per_scale   # number of groups of latent vars. per scale
@@ -166,7 +198,7 @@ class AutoEncoder(nn.Module):
 
         self.with_nf = args.num_nf > 0
         self.num_flows = args.num_nf
-        if self.latent_distribution == 'mixed_poisson_gamma' and self.with_nf:
+        if self.latent_distribution != 'normal' and self.with_nf:
             raise ValueError('Normalizing flows are only implemented for Normal latents; use --num_nf 0.')
 
         self.enc0 = self.init_encoder0(mult)
@@ -351,6 +383,8 @@ class AutoEncoder(nn.Module):
     def _latent_kind(self, group_index):
         if self.latent_distribution == 'normal':
             return 'normal'
+        if self.latent_distribution == 'poisson':
+            return 'poisson'
         # Decoder order is low to high resolution for groups_per_scale [4, 2].
         return 'poisson' if group_index < 2 else 'gamma'
 
@@ -383,10 +417,65 @@ class AutoEncoder(nn.Module):
                            max_rate=self.poisson_max_rate)
         return Gamma(zeros, zeros, temp=temp)
 
-    def _sample_latent(self, dist, relaxed_poisson=False):
+    def set_obbvi_component(self, component):
+        if component < 0 or component >= len(self.obbvi_taus):
+            raise ValueError('O-BBVI component index is out of range.')
+        self._obbvi_component = int(component)
+
+    def _sample_latent(self, dist, training_sample=False):
         if isinstance(dist, Poisson):
-            return dist.sample(relaxed=relaxed_poisson)
+            estimator = self.poisson_gradient_estimator if training_sample else 'exact'
+            proposal_tau = None
+            if estimator == 'obbvi':
+                proposal_tau = self.obbvi_taus[self._obbvi_component]
+            z, _ = dist.sample(estimator=estimator, proposal_tau=proposal_tau)
+            proposal_log_probs = None
+            if estimator == 'obbvi':
+                proposal_log_probs = torch.stack(
+                    [dist.proposal_log_p(z, tau) for tau in self.obbvi_taus], dim=0)
+            return z, proposal_log_probs
         return dist.sample()
+
+    def score_baseline(self, reference):
+        if self._score_baseline_value is None:
+            return reference.new_zeros(())
+        return reference.new_tensor(self._score_baseline_value)
+
+    def update_score_baseline(self, signals):
+        """Update an EMA baseline after all samples in the minibatch are used."""
+        value = float(torch.mean(torch.stack(signals)).detach().float().item())
+        if self._score_baseline_value is None:
+            self._score_baseline_value = value
+        else:
+            decay = self.score_baseline_decay
+            self._score_baseline_value = decay * self._score_baseline_value + \
+                (1. - decay) * value
+
+    def score_function_objective(self, recon_loss, kl_coeff, baseline):
+        """Build the exact-sample REINFORCE/O-BBVI surrogate objective.
+
+        The returned first tensor is differentiated. The sampled NELBO and
+        importance weight are detached diagnostics. Proposal weights are also
+        detached so autograd does not differentiate through the sampler.
+        """
+        if self._gradient_context is None:
+            raise RuntimeError('forward() must run before requesting a score objective.')
+        log_q = self._gradient_context['log_q']
+        log_p = self._gradient_context['log_p']
+        sampled_nelbo = recon_loss.float() + float(kl_coeff) * (log_q - log_p)
+
+        if self.poisson_gradient_estimator == 'obbvi':
+            log_proposal = self._gradient_context['log_proposal']
+            importance_weight = torch.exp(log_q - log_proposal).detach()
+        else:
+            importance_weight = torch.ones_like(sampled_nelbo)
+
+        centered_signal = sampled_nelbo.detach() - baseline
+        # Direct gradients train p_theta(x,z); the likelihood-ratio term trains
+        # every parameter that participates in q_phi(z|x).
+        generative = importance_weight * (recon_loss.float() - float(kl_coeff) * log_p)
+        inference = importance_weight * centered_signal * log_q
+        return generative + inference, sampled_nelbo.detach(), importance_weight
 
     def forward(self, x):
         s = self.stem(2 * x - 1.0)
@@ -413,7 +502,7 @@ class AutoEncoder(nn.Module):
         ftr = self.enc0(s)                            # this reduces the channel dimension
         param0 = self.enc_sampler[idx_dec](ftr)
         dist = self._latent_from_param(idx_dec, param0)   # first approximate posterior
-        z, _ = self._sample_latent(dist, relaxed_poisson=self.training)
+        z, proposal_log_probs = self._sample_latent(dist, training_sample=self.training)
         log_q_conv = dist.log_p(z)
 
         # apply normalizing flows
@@ -424,6 +513,9 @@ class AutoEncoder(nn.Module):
         nf_offset += self.num_flows
         all_q = [dist]
         all_log_q = [log_q_conv]
+        all_proposal_log_probs = []
+        if proposal_log_probs is not None:
+            all_proposal_log_probs.append(proposal_log_probs)
 
         # To make sure we do not pass any deterministic features from x to decoder.
         s = 0
@@ -450,7 +542,7 @@ class AutoEncoder(nn.Module):
                     ftr = combiner_cells_enc[idx_dec - 1](combiner_cells_s[idx_dec - 1], s)
                     param = self.enc_sampler[idx_dec](ftr)
                     dist = self._latent_from_param(idx_dec, param, residual_param=prior_param)
-                    z, _ = self._sample_latent(dist, relaxed_poisson=self.training)
+                    z, proposal_log_probs = self._sample_latent(dist, training_sample=self.training)
                     log_q_conv = dist.log_p(z)
                     # apply NF
                     for n in range(self.num_flows):
@@ -459,6 +551,8 @@ class AutoEncoder(nn.Module):
                     nf_offset += self.num_flows
                     all_log_q.append(log_q_conv)
                     all_q.append(dist)
+                    if proposal_log_probs is not None:
+                        all_proposal_log_probs.append(proposal_log_probs)
 
                     # evaluate log_p(z)
                     dist = prior_dist
@@ -495,6 +589,18 @@ class AutoEncoder(nn.Module):
             log_q += torch.sum(log_q_conv, dim=[1, 2, 3])
             log_p += torch.sum(log_p_conv, dim=[1, 2, 3])
 
+        self._gradient_context = {'log_q': log_q.float(), 'log_p': log_p.float()}
+        if self.training and self.poisson_gradient_estimator == 'obbvi':
+            if len(all_proposal_log_probs) != len(all_q):
+                raise RuntimeError('O-BBVI requires every latent group to be Poisson.')
+            component_log_probs = None
+            for proposal_log_probs in all_proposal_log_probs:
+                group_log_probs = torch.sum(proposal_log_probs.float(), dim=[2, 3, 4])
+                component_log_probs = group_log_probs if component_log_probs is None \
+                    else component_log_probs + group_log_probs
+            self._gradient_context['log_proposal'] = torch.logsumexp(
+                component_log_probs, dim=0) - np.log(float(len(self.obbvi_taus)))
+
         return logits, log_q, log_p, kl_all, kl_diag
 
     def sample(self, num_samples, t):
@@ -502,7 +608,7 @@ class AutoEncoder(nn.Module):
         z0_size = [num_samples] + self.z0_size
         reference = torch.zeros(z0_size, device=self.prior_ftr0.device)
         dist = self._fixed_prior(0, reference, temp=t)
-        z, _ = self._sample_latent(dist, relaxed_poisson=False)
+        z, _ = self._sample_latent(dist, training_sample=False)
 
         idx_dec = 0
         s = self.prior_ftr0.unsqueeze(0)
@@ -514,7 +620,7 @@ class AutoEncoder(nn.Module):
                     # form prior
                     param = self.dec_sampler[idx_dec - 1](s)
                     dist = self._latent_from_param(idx_dec, param, temp=t)
-                    z, _ = self._sample_latent(dist, relaxed_poisson=False)
+                    z, _ = self._sample_latent(dist, training_sample=False)
 
                 # 'combiner_dec'
                 s = cell(s, z)

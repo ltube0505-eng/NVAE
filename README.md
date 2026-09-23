@@ -392,6 +392,13 @@ high-resolution Gamma groups, and the original dataset-default reconstruction
 distribution while retaining the NVAE network hierarchy. See
 [the design, literature review, limitations, and training command](docs/mixed_poisson_gamma_hvae.md).
 
+### All-Poisson hierarchy and gradient estimators
+
+`--latent_distribution poisson` makes every latent group Poisson. A unified
+interface selects continuous relaxation, REINFORCE, O-BBVI/DMIS, or the
+existing straight-through estimator. See the [mathematical definition,
+commands, implementation notes, and tests](docs/all_poisson_gradient_estimators.md).
+
 
 ## Traversing the latent space
 We can generate images by traversing in the latent space of NVAE. This sequence is generated using our model
