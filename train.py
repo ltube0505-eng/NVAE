@@ -164,17 +164,65 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
 
         cnn_optimizer.zero_grad()
         with autocast():
-            logits, log_q, log_p, kl_all, kl_diag = model(x)
-
-            output = model.decoder_output(logits)
             kl_coeff = utils.kl_coeff(global_step, args.kl_anneal_portion * args.num_total_iter,
                                       args.kl_const_portion * args.num_total_iter, args.kl_const_coeff)
+            score_estimator = model.poisson_gradient_estimator in {'reinforce', 'obbvi'}
+            importance_ess = None
 
-            recon_loss = utils.reconstruction_loss(output, x, crop=model.crop_output)
-            balanced_kl, kl_coeffs, kl_vals = utils.kl_balancer(kl_all, kl_coeff, kl_balance=True, alpha_i=alpha_i)
+            if score_estimator:
+                if model.poisson_gradient_estimator == 'obbvi':
+                    num_gradient_samples = model.obbvi_num_samples
+                    num_components = len(model.obbvi_taus)
+                else:
+                    num_gradient_samples = model.reinforce_num_samples
+                    num_components = 1
 
-            nelbo_batch = recon_loss + balanced_kl
-            loss = torch.mean(nelbo_batch)
+                baseline = model.score_baseline(x)
+                objectives, sampled_nelbos, importance_weights = [], [], []
+                kl_samples, kl_diag_samples, recon_samples = [], [], []
+                for sample_index in range(num_gradient_samples):
+                    if model.poisson_gradient_estimator == 'obbvi':
+                        # Deterministic MIS: draw the same number from each proposal.
+                        model.set_obbvi_component(sample_index % num_components)
+                    logits, log_q, log_p, kl_all_i, kl_diag_i = model(x)
+                    output = model.decoder_output(logits)
+                    recon_loss_i = utils.reconstruction_loss(output, x, crop=model.crop_output)
+                    objective_i, sampled_nelbo_i, importance_weight_i = \
+                        model.score_function_objective(recon_loss_i, kl_coeff, baseline)
+                    objectives.append(objective_i)
+                    sampled_nelbos.append(sampled_nelbo_i)
+                    importance_weights.append(importance_weight_i)
+                    kl_samples.append(kl_all_i)
+                    kl_diag_samples.append(kl_diag_i)
+                    recon_samples.append(recon_loss_i.detach())
+
+                # Update only after all current samples have used the old baseline;
+                # this keeps the control variate independent of those samples.
+                model.update_score_baseline(sampled_nelbos)
+                loss = torch.mean(torch.stack(objectives))
+                weight_stack = torch.stack(importance_weights)
+                signal_stack = torch.stack(sampled_nelbos)
+                nelbo_batch = torch.mean(weight_stack * signal_stack, dim=0)
+                recon_loss = torch.mean(torch.stack(recon_samples), dim=0)
+                importance_ess = torch.mean(
+                    torch.sum(weight_stack, dim=0) ** 2 /
+                    torch.sum(weight_stack ** 2, dim=0).clamp_min(1e-8))
+
+                kl_all = [torch.mean(torch.stack([sample[group] for sample in kl_samples]), dim=0)
+                          for group in range(len(kl_samples[0]))]
+                kl_diag = [torch.mean(torch.stack([sample[group] for sample in kl_diag_samples]), dim=0)
+                           for group in range(len(kl_diag_samples[0]))]
+                _, kl_coeffs, kl_vals = utils.kl_balancer(kl_all, kl_coeff, kl_balance=False)
+            else:
+                logits, log_q, log_p, kl_all, kl_diag = model(x)
+                output = model.decoder_output(logits)
+                recon_loss = utils.reconstruction_loss(output, x, crop=model.crop_output)
+                balanced_kl, kl_coeffs, kl_vals = utils.kl_balancer(
+                    kl_all, kl_coeff, kl_balance=True, alpha_i=alpha_i)
+                nelbo_batch = recon_loss + balanced_kl
+                loss = torch.mean(nelbo_batch)
+
+            reported_nelbo = torch.mean(nelbo_batch.detach())
             norm_loss = model.spectral_norm_parallel()
             bn_loss = model.batchnorm_loss()
             # get spectral regularization coefficient (lambda)
@@ -191,7 +239,7 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
         utils.average_gradients(model.parameters(), args.distributed)
         grad_scalar.step(cnn_optimizer)
         grad_scalar.update()
-        nelbo.update(loss.data, 1)
+        nelbo.update(reported_nelbo.data, 1)
 
         if (global_step + 1) % 100 == 0:
             if (global_step + 1) % 1000 == 0:  # reduced frequency
@@ -214,10 +262,12 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
             writer.add_scalar('train/nelbo_avg', nelbo.avg, global_step)
             writer.add_scalar('train/lr', cnn_optimizer.state_dict()[
                               'param_groups'][0]['lr'], global_step)
-            writer.add_scalar('train/nelbo_iter', loss, global_step)
+            writer.add_scalar('train/nelbo_iter', reported_nelbo, global_step)
             writer.add_scalar('train/kl_iter', torch.mean(sum(kl_all)), global_step)
-            writer.add_scalar('train/recon_iter', torch.mean(utils.reconstruction_loss(output, x, crop=model.crop_output)), global_step)
+            writer.add_scalar('train/recon_iter', torch.mean(recon_loss), global_step)
             writer.add_scalar('kl_coeff/coeff', kl_coeff, global_step)
+            if importance_ess is not None:
+                writer.add_scalar('train/importance_ess', importance_ess, global_step)
             total_active = 0
             for i, kl_diag_i in enumerate(kl_diag):
                 utils.average_tensor(kl_diag_i, args.distributed)
@@ -388,15 +438,25 @@ if __name__ == '__main__':
     parser.add_argument('--num_latent_per_group', type=int, default=20,
                         help='number of channels in latent variables per group')
     parser.add_argument('--latent_distribution', type=str, default='normal',
-                        choices=['normal', 'mixed_poisson_gamma'],
-                        help='latent family; mixed mode uses 2 low-resolution Poisson groups and '
-                             '4 high-resolution Gamma groups')
+                        choices=['normal', 'poisson', 'mixed_poisson_gamma'],
+                        help='latent family; poisson makes every latent group Poisson')
+    parser.add_argument('--poisson_gradient_estimator', type=str, default='straight_through',
+                        choices=['relaxed', 'reinforce', 'obbvi', 'straight_through'],
+                        help='gradient estimator used by Poisson latent groups')
     parser.add_argument('--poisson_relaxation_temperature', type=float, default=0.1,
-                        help='sigmoid temperature for straight-through Poisson arrival indicators')
+                        help='sigmoid temperature for relaxed/ST Poisson arrival indicators')
     parser.add_argument('--poisson_max_count', type=int, default=64,
                         help='number of exponential arrivals used by relaxed Poisson sampling')
     parser.add_argument('--poisson_max_rate', type=float, default=30.,
                         help='upper bound on Poisson rates to control count truncation')
+    parser.add_argument('--reinforce_num_samples', type=int, default=1,
+                        help='exact posterior samples per minibatch for REINFORCE')
+    parser.add_argument('--score_baseline_decay', type=float, default=0.9,
+                        help='EMA decay for the score-function control-variate baseline')
+    parser.add_argument('--obbvi_taus', type=str, default='1.0,3.0',
+                        help='comma-separated O-BBVI Poisson proposal dispersions; include 1')
+    parser.add_argument('--obbvi_num_samples', type=int, default=8,
+                        help='DMIS trajectories per minibatch; divisible by number of taus')
     parser.add_argument('--ada_groups', action='store_true', default=False,
                         help='Settings this to true will set different number of groups per scale.')
     parser.add_argument('--min_groups_per_scale', type=int, default=1,

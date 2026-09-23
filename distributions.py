@@ -51,12 +51,16 @@ class Normal:
 
 
 class Poisson:
-    """Poisson latent with an analytic KL and a straight-through pathwise surrogate.
+    """Poisson latent with exact, relaxed, ST, and O-BBVI sampling helpers.
 
-    The relaxed sample represents a Poisson process as exponential inter-arrival
-    times. Its forward value is an integer count; its backward value uses a
-    sigmoid relaxation of the arrival-time indicators. Exact sampling is used
-    when ``relaxed`` is false.
+    ``relaxed`` uses the exponential-arrival construction used by PoissonVAE
+    and NegBio-VAE.  ``straight_through`` has an integer forward value and the
+    same relaxed backward path.  Score-function estimators use ``exact``.
+
+    For O-BBVI, a dispersion coefficient ``tau`` defines the proposal
+    ``Poisson(rate ** (1 / tau))``.  This is the overdispersed exponential-
+    family proposal from Ruiz, Titsias, and Blei (2016); it is not a negative
+    binomial observation model.
     """
 
     def __init__(self, log_rate, relaxation_temperature=0.1, max_count=64, max_rate=30.):
@@ -67,15 +71,15 @@ class Poisson:
         if max_rate <= 0.:
             raise ValueError('max_rate must be positive.')
         max_log_rate = float(np.log(max_rate))
-        self.log_rate = torch.clamp(soft_clamp5(log_rate), max=max_log_rate)
-        self.rate = torch.exp(self.log_rate) + 1e-4
+        clamped_log_rate = torch.clamp(soft_clamp5(log_rate), max=max_log_rate)
+        self.rate = torch.exp(clamped_log_rate)
+        # Keep log_p and the analytic KL exactly consistent with ``rate``.
+        self.log_rate = torch.log(self.rate)
         self.relaxation_temperature = relaxation_temperature
         self.max_count = max_count
 
-    def sample(self, relaxed=False):
-        if not relaxed:
-            return torch.poisson(self.rate), None
-
+    def _arrival_counts(self):
+        """Return hard and relaxed counts built from the same arrivals."""
         # A homogeneous Poisson count is the number of exponential arrival
         # times before t=1. Truncation is controlled by max_count/max_rate.
         exponential = torch.distributions.Exponential(self.rate)
@@ -84,8 +88,36 @@ class Poisson:
         hard_count = (arrival_times <= 1.).to(self.rate.dtype).sum(dim=0)
         soft_count = torch.sigmoid(
             (1. - arrival_times) / self.relaxation_temperature).sum(dim=0)
-        count = hard_count + soft_count - soft_count.detach()
-        return count, None
+        return hard_count, soft_count
+
+    def sample(self, relaxed=False, estimator=None, proposal_tau=None):
+        """Sample with a named gradient estimator.
+
+        ``relaxed`` is retained for backward compatibility. New code should use
+        ``estimator`` in {``exact``, ``relaxed``, ``straight_through``,
+        ``obbvi``}. O-BBVI returns an exact proposal sample; importance weights
+        are computed separately with :meth:`proposal_log_p`.
+        """
+        if estimator is None:
+            estimator = 'straight_through' if relaxed else 'exact'
+
+        if estimator in {'exact', 'reinforce'}:
+            return torch.poisson(self.rate), None
+
+        if estimator == 'obbvi':
+            if proposal_tau is None:
+                raise ValueError('proposal_tau is required for O-BBVI sampling.')
+            return torch.poisson(self.proposal_rate(proposal_tau)), None
+
+        hard_count, soft_count = self._arrival_counts()
+        if estimator == 'relaxed':
+            return soft_count, None
+        if estimator == 'straight_through':
+            # Parenthesize the zero-valued term so the stored forward value is
+            # bit-for-bit the integer hard count (not hard + round-off noise).
+            count = hard_count + (soft_count - soft_count.detach())
+            return count, None
+        raise ValueError('Unknown Poisson estimator: %s' % estimator)
 
     def log_p(self, samples):
         samples = torch.clamp(samples, min=0.)
@@ -95,6 +127,26 @@ class Poisson:
         return self.rate * (self.log_rate - poisson_dist.log_rate) + \
             poisson_dist.rate - self.rate
 
+    def proposal_rate(self, tau):
+        """Rate of the O-BBVI overdispersed Poisson proposal."""
+        if tau < 1.:
+            raise ValueError('O-BBVI dispersion tau must be at least one.')
+        return torch.exp(self.log_rate / float(tau))
+
+    def proposal_log_p(self, samples, tau):
+        proposal_rate = self.proposal_rate(tau)
+        samples = torch.clamp(samples, min=0.)
+        return samples * torch.log(proposal_rate) - proposal_rate - \
+            torch.lgamma(samples + 1.)
+
+    def proposal_mixture_log_p(self, samples, taus):
+        """Log density of an equally weighted O-BBVI proposal mixture."""
+        if not taus:
+            raise ValueError('At least one O-BBVI dispersion is required.')
+        log_probs = torch.stack(
+            [self.proposal_log_p(samples, tau) for tau in taus], dim=0)
+        return torch.logsumexp(log_probs, dim=0) - np.log(float(len(taus)))
+
 
 class Gamma:
     """Gamma latent parameterized by unconstrained log-shape/log-rate tensors."""
@@ -102,10 +154,13 @@ class Gamma:
     def __init__(self, log_shape, log_rate, temp=1.):
         if temp <= 0.:
             raise ValueError('temp must be positive.')
-        self.log_shape = soft_clamp5(log_shape)
-        self.log_rate = soft_clamp5(log_rate)
-        self.shape = torch.exp(self.log_shape) + 1e-4
-        self.rate = torch.exp(self.log_rate) + 1e-4
+        clamped_log_shape = soft_clamp5(log_shape)
+        clamped_log_rate = soft_clamp5(log_rate)
+        self.shape = torch.exp(clamped_log_shape) + 1e-4
+        self.rate = torch.exp(clamped_log_rate) + 1e-4
+        # Densities and KL must use logs of the actual epsilon-adjusted values.
+        self.log_shape = torch.log(self.shape)
+        self.log_rate = torch.log(self.rate)
         if temp != 1.:
             # Preserve the mean while scaling variance by ``temp``.
             self.shape = self.shape / temp
