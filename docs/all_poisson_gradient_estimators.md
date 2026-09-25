@@ -13,7 +13,7 @@
 | `relaxed` | 连续 soft count | 到达时间的路径梯度 | 否，优化连续松弛目标 |
 | `straight_through` | 整数 hard count | soft count 的路径梯度 | 否，hard-forward/soft-backward |
 | `reinforce` | 从后验精确采样的整数 | score function + 上一批次 EMA baseline | 是 |
-| `obbvi` | 仅当前组从过度离散 proposal 精确采样，后续组从条件后验重采样 | 逐组条件 DMIS score；逐样本或解析 KL 目标 | 是（支撑覆盖且矩存在时） |
+| `obbvi` | 仅当前组从过度离散 proposal 精确采样，后续组从条件后验重采样 | 逐组条件 DMIS score、独立 pilot 估计的逐组 Poisson baseline；逐样本或解析 KL 目标 | 是（支撑覆盖且矩存在时） |
 
 `relaxed` 与 `straight_through` 使用同一组指数到达时间
 
@@ -99,7 +99,22 @@ m_i(z_i\mid x,z_{<i})=\frac1J\sum_{t=1}^{J}r_{it}(z_i\mid x,z_{<i}),
 
 其直接导数另用一条基准后验轨迹上的 \(R_{\rm loss}-\beta\sum_j\log p_j\) 估计。`--obbvi_objective analytic_kl`（默认）使用同一组条件 proposal，但把全部组的 KL 积分为解析式 \(K_j(z_{<j})\)。这时组 \(i\) 的 score 系数变成 \(R_{\rm loss}+\beta\sum_{j>i}K_j-b\)；基准轨迹的直接导数是 \(R_{\rm loss}+\beta\sum_j K_j\)，包含每个 \(K_i\) 对参数的直接导数。对于最小化符号，以上所有符号与最大化 ELBO 的公式相反。Poisson 本组 KL 为 \(\sum_d[\lambda^q_d\log(\lambda^q_d/\lambda^p_d)+\lambda^p_d-\lambda^q_d]\)。
 
-基准轨迹的离散样本与复用的前缀均从 autograd 图分离；每个组的 score、proposal 权重、KL 值和 baseline 在 score 系数内固定。基准轨迹的解析 KL 本身正常反传。直接导数**只计算一次**，逐组 score 求和。默认每组 `--obbvi_taus 1.0,3.0`、`--obbvi_num_samples 8`，样本数必须能被 tau 数整除。训练代价约为 \(1+G\times S\) 次前向传播，早期组需重算最长的后缀。
+基准轨迹的离散样本与复用的前缀均从 autograd 图分离；每个组的 score、proposal 权重、KL 值和 baseline 在 score 系数内固定。基准轨迹的解析 KL 本身正常反传。直接导数**只计算一次**，逐组 score 求和。
+
+### 每个 Poisson 组自己的条件 baseline
+
+O-BBVI 不再复用 REINFORCE 的跨 minibatch EMA。固定 \(x,z_{<i}^{(0)}\)，当前组后验是 \(q_i=\prod_d\operatorname{Pois}(\lambda_{id})\)，其对 **log rate 坐标**的 score 向量是 \(H_i=z_i-\lambda_i\)。设 \(A_i=R_{\rm loss}+\beta\sum_{j>i}c_jK_j\)（解析 KL 模式），或 \(A_i=R_{\rm loss}+\beta\sum_{j\ge i}c_j(\log q_j-\log p_j)\)（sampled 模式）。若每次从混合分布 \(m_i\) 独立采样，按 log rate score 的平方范数加权的条件方差最小标量是
+
+\[
+b_i^*(x,z_{<i}^{(0)})=
+\frac{\mathbb E_{m_i q_{>i}}[w_i^2\|z_i-\lambda_i\|_2^2 A_i]}
+{\mathbb E_{m_i q_{>i}}[w_i^2\|z_i-\lambda_i\|_2^2]},
+\qquad w_i=q_i/m_i.
+\]
+
+每组默认用 `--obbvi_baseline_samples 4` 条**独立** pilot 轨迹（每个 tau 分量两条），按上式的样本比值计算每张图自己的 \(b_i\)，随后重新采集 `--obbvi_num_samples 8` 条梯度轨迹。pilot 的当前组来自对应 Poisson proposal，后缀按条件后验重采样；基准前缀可共用。baseline 与后续梯度样本条件独立，因此即使有限 pilot 的比值并非 \(b_i^*\) 的无偏估计，也不改变梯度期望。实际梯度使用每个分量固定等量采样的 DMIS；上式是其混合分布方差的近似准则，固定配额下的精确最优 baseline 还取决于各分量的 score 均值。神经网络参数的 Jacobian 和不同组的协方差也会改变最优值。零分母返回零，样本数须能被 tau 数整除。计算代价约为 \(1+G(S+B)\) 次前向传播，早期组需重算最长的后缀。增大 `--obbvi_baseline_samples` 可使估计更稳定，但会增加计算量。
+
+解析 KL 模式的 score 不包含本组 \(K_i\)：它在固定前缀下已对 \(z_i\) 积分，本组 KL 的直接导数由基准轨迹提供。sampled 模式须保留本组 \(\log q_i-\log p_i\) 及其直接导数分解。在相同固定 \(\beta,c_j\) 下，两种公式对应同一个期望目标及其梯度，但不能逐样本将解析 KL 信号等同于 sampled 信号，也不能将最大化 ELBO 的符号直接用于最小化 NELBO。
 
 ### 跨估计器使用相同的 KL balancing
 
@@ -145,8 +160,7 @@ python train.py ... --latent_distribution poisson --num_nf 0 \
 python train.py ... --latent_distribution poisson --num_nf 0 \
   --poisson_gradient_estimator obbvi \
   --obbvi_taus 1.0,3.0 --obbvi_num_samples 8 \
-  --obbvi_objective analytic_kl \
-  --score_baseline_decay 0.9
+  --obbvi_baseline_samples 4 --obbvi_objective analytic_kl
 
 # 若要使用逐样本 log q/p 版本，将上一条命令的目标切换为：
 # --obbvi_objective sampled
@@ -174,8 +188,8 @@ pytest -q
 2. continuous relaxation 前向非整数，而 straight-through 前向严格为整数；
 3. 两种路径估计器均有有限梯度；
 4. Poisson–Poisson 解析 KL 与 PyTorch 精确结果一致；
-5. O-BBVI proposal 的 \(\lambda^{1/\tau}\) 参数化、\(w\le J\) 上界及
-   \(\mathbb E_m[(q/m)z]=\mathbb E_q[z]\) 恒等式；
+5. O-BBVI proposal 的 \(\lambda^{1/\tau}\) 参数化、\(w\le J\) 上界、
+   \(\mathbb E_m[(q/m)z]=\mathbb E_q[z]\) 恒等式及条件 baseline 的零均值性质与方差；
 6. 全模型 REINFORCE surrogate 可反向传播；
 7. 全模型条件 O-BBVI 固定前缀、只对当前组加权、两种目标产生有限梯度；
 8. 改变目标组计数时重新计算后续组的条件参数；小型双层例子中两种 score 公式在均匀及非均匀固定 KL 权重下均与精确目标的数值导数一致；
