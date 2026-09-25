@@ -169,21 +169,52 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
             score_estimator = model.poisson_gradient_estimator in {'reinforce', 'obbvi'}
             importance_ess = None
 
-            if score_estimator:
-                if model.poisson_gradient_estimator == 'obbvi':
-                    num_gradient_samples = model.obbvi_num_samples
-                    num_components = len(model.obbvi_taus)
+            if model.poisson_gradient_estimator == 'obbvi' and model.latent_distribution == 'poisson':
+                # One target-q trajectory supplies unbiased direct derivatives.
+                logits, log_q, log_p, kl_all, kl_diag = model(x)
+                prefix_samples = [z.detach() for z in model._gradient_context['samples']]
+                output = model.decoder_output(logits)
+                recon_loss = utils.reconstruction_loss(output, x, crop=model.crop_output)
+                beta = float(kl_coeff)
+                if model.obbvi_objective == 'analytic_kl':
+                    direct = recon_loss + beta * sum(kl_all)
+                    nelbo_batch = direct.detach()
                 else:
-                    num_gradient_samples = model.reinforce_num_samples
-                    num_components = 1
-
+                    direct = recon_loss - beta * log_p
+                    nelbo_batch = (recon_loss + beta * (log_q - log_p)).detach()
+                baseline = model.score_baseline(x)
+                score_terms, signals, group_ess = [], [], []
+                num_components = len(model.obbvi_taus)
+                for group in range(model.num_groups):
+                    group_scores, group_weights = [], []
+                    for sample_index in range(model.obbvi_num_samples):
+                        model.set_obbvi_component(sample_index % num_components)
+                        proposal_logits, _, _, _, _ = model(
+                            x, prefix_samples=prefix_samples, proposal_group=group)
+                        proposal_output = model.decoder_output(proposal_logits)
+                        proposal_recon = utils.reconstruction_loss(
+                            proposal_output, x, crop=model.crop_output)
+                        score, signal, weight = model.conditional_score_objective(
+                            proposal_recon, kl_coeff, baseline, group)
+                        group_scores.append(score)
+                        group_weights.append(weight)
+                        signals.append(signal)
+                    score_terms.append(torch.stack(group_scores).mean(dim=0))
+                    weight_stack = torch.stack(group_weights)
+                    group_ess.append(torch.mean(
+                        torch.sum(weight_stack, dim=0) ** 2 /
+                        torch.sum(weight_stack ** 2, dim=0).clamp_min(1e-8)))
+                model.update_score_baseline(signals)
+                loss = torch.mean(direct + sum(score_terms))
+                importance_ess = torch.stack(group_ess).mean()
+                _, kl_coeffs, kl_vals = utils.kl_balancer(
+                    kl_all, kl_coeff, kl_balance=False)
+            elif score_estimator:
+                num_gradient_samples = model.reinforce_num_samples
                 baseline = model.score_baseline(x)
                 objectives, sampled_nelbos, importance_weights = [], [], []
                 kl_samples, kl_diag_samples, recon_samples = [], [], []
                 for sample_index in range(num_gradient_samples):
-                    if model.poisson_gradient_estimator == 'obbvi':
-                        # Deterministic MIS: draw the same number from each proposal.
-                        model.set_obbvi_component(sample_index % num_components)
                     logits, log_q, log_p, kl_all_i, kl_diag_i = model(x)
                     output = model.decoder_output(logits)
                     recon_loss_i = utils.reconstruction_loss(output, x, crop=model.crop_output)
@@ -456,7 +487,10 @@ if __name__ == '__main__':
     parser.add_argument('--obbvi_taus', type=str, default='1.0,3.0',
                         help='comma-separated O-BBVI Poisson proposal dispersions; include 1')
     parser.add_argument('--obbvi_num_samples', type=int, default=8,
-                        help='DMIS trajectories per minibatch; divisible by number of taus')
+                        help='conditional proposal samples per group; divisible by number of taus')
+    parser.add_argument('--obbvi_objective', type=str, default='analytic_kl',
+                        choices=['sampled', 'analytic_kl'],
+                        help='sampled log q/p or per-group analytic conditional Poisson KL')
     parser.add_argument('--ada_groups', action='store_true', default=False,
                         help='Settings this to true will set different number of groups per scale.')
     parser.add_argument('--min_groups_per_scale', type=int, default=1,

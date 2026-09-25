@@ -13,7 +13,7 @@
 | `relaxed` | 连续 soft count | 到达时间的路径梯度 | 否，优化连续松弛目标 |
 | `straight_through` | 整数 hard count | soft count 的路径梯度 | 否，hard-forward/soft-backward |
 | `reinforce` | 从后验精确采样的整数 | score function + 上一批次 EMA baseline | 是 |
-| `obbvi` | 从过度离散 proposal 精确采样的整数 | DMIS importance-weighted score function + EMA baseline | 是（支撑覆盖且矩存在时） |
+| `obbvi` | 仅当前组从过度离散 proposal 精确采样，后续组从条件后验重采样 | 逐组条件 DMIS score；逐样本或解析 KL 目标 | 是（支撑覆盖且矩存在时） |
 
 `relaxed` 与 `straight_through` 使用同一组指数到达时间
 
@@ -60,9 +60,9 @@ L_{\rm score}=
 
 其中 \(b\) 是仅由此前 minibatch 更新的指数移动平均。当前批次先使用旧 baseline，再更新 baseline，因此 baseline 与当前抽样独立，不改变 score estimator 的期望。
 
-score-function 模式不再把解析 Poisson KL 直接加入反向目标；否则会把路径梯度目标和 likelihood-ratio 目标重复计算。解析 KL 仍用于监控各 group 的规模与活跃度。KL balancing 只保留在 `relaxed`/`straight_through` 模式；`reinforce`/`obbvi` 使用统一标量 KL warm-up 系数 \(\beta\)。
+`reinforce` 和 `obbvi --obbvi_objective sampled` 的直接导数不加入解析 KL；解析 KL 用于监控。`obbvi --obbvi_objective analytic_kl` 对解析 KL 求直接导数，同时将后续 KL 值纳入各组 score 系数。KL balancing 只保留在 `relaxed`/`straight_through` 模式；score 模式使用统一标量 KL warm-up 系数 \(\beta\)。
 
-## 3. O-BBVI/DMIS 实现
+## 3. 沿 NVAE 顺序的逐组条件 proposal
 
 论文的 Poisson proposal 为
 
@@ -74,39 +74,42 @@ r_{ij}(z_i\mid z_{<i},x)=
 \quad \tau_j\ge 1.
 \]
 
-层级模型中每条轨迹的第 \(j\) 个 proposal 是条件分布的乘积：
+给定基准轨迹 \(z^{(0)}\sim q_\phi\)，逐组固定其前缀 \(z_{<i}^{(0)}\)。对于组 \(i\)，从 \(r_{it}\) 重新采样 \(z_i\)，把它注入 decoder combiner；随后重算先验头、融合后验头及 decoder 状态，按 \(q_j(z_j\mid x,z_{<j})\) 逐组重采样整个后缀。对应完整轨迹的抽样分布是
 
 \[
-r_j(z\mid x)=\prod_i r_{ij}(z_i\mid z_{<i},x).
+\widetilde q_{it}(z\mid x)=q_\phi(z_{<i}\mid x)\,r_{it}(z_i\mid x,z_{<i})\,
+q_\phi(z_{>i}\mid x,z_{\le i}).
 \]
 
-实现使用 deterministic multiple importance sampling（DMIS）：从每个 \(r_j\) 抽取相同数量的完整层级轨迹，并使用 balance-heuristic mixture
+对固定的组 \(i\)，实现 deterministic multiple importance sampling（DMIS）：每个 \(r_{it}\) 抽相同数量的条件轨迹，权重只含被替换的这一组：
 
 \[
-m(z\mid x)=\frac1J\sum_{j=1}^{J}r_j(z\mid x),
-\qquad
-w(z)=\frac{q_\phi(z\mid x)}{m(z\mid x)}.
+m_i(z_i\mid x,z_{<i})=\frac1J\sum_{t=1}^{J}r_{it}(z_i\mid x,z_{<i}),
+\qquad w_i=\frac{q_i(z_i\mid x,z_{<i})}{m_i(z_i\mid x,z_{<i})}.
 \]
 
-O-BBVI 的 surrogate 为
+`--obbvi_objective sampled` 使用逐样本 \(\log q-\log p\)。对最小化 NELBO，第 \(i\) 组的 score 系数是
 
 \[
-w(z)L_{\rm gen}
-+\operatorname{stopgrad}\!\left(w(z)(F_\beta-b)\right)
-\log q_\phi(z\mid x).
+\widehat g_i^{\rm score}=\frac1S\sum_s w_i^{(s)}
+\operatorname{stopgrad}\left[R_{\rm loss}(z^{(s)})+
+\beta\sum_{j=i}^G(\log q_j-\log p_j)-b\right]
+\nabla_\phi\log q_i(z_i^{(s)}\mid x,z_{<i}^{(0)}).
 \]
 
-proposal sample 和 importance weight 均从 autograd 图中分离；只有 `log q` 承担 score-function 梯度。默认 `--obbvi_taus 1.0,3.0`、`--obbvi_num_samples 8`。样本数必须能被 proposal 数整除。
+其直接导数另用一条基准后验轨迹上的 \(R_{\rm loss}-\beta\sum_j\log p_j\) 估计。`--obbvi_objective analytic_kl`（默认）使用同一组条件 proposal，但把全部组的 KL 积分为解析式 \(K_j(z_{<j})\)。这时组 \(i\) 的 score 系数变成 \(R_{\rm loss}+\beta\sum_{j>i}K_j-b\)；基准轨迹的直接导数是 \(R_{\rm loss}+\beta\sum_j K_j\)，包含每个 \(K_i\) 对参数的直接导数。对于最小化符号，以上所有符号与最大化 ELBO 的公式相反。Poisson 本组 KL 为 \(\sum_d[\lambda^q_d\log(\lambda^q_d/\lambda^p_d)+\lambda^p_d-\lambda^q_d]\)。
 
-配置强制 mixture 含有 \(\tau=1\)。此时一个分量正好是 \(q\)，从而逐点有
+基准轨迹的离散样本与复用的前缀均从 autograd 图分离；每个组的 score、proposal 权重、KL 值和 baseline 在 score 系数内固定。基准轨迹的解析 KL 本身正常反传。直接导数**只计算一次**，逐组 score 求和。默认每组 `--obbvi_taus 1.0,3.0`、`--obbvi_num_samples 8`，样本数必须能被 tau 数整除。训练代价约为 \(1+G\times S\) 次前向传播，早期组需重算最长的后缀。
+
+配置强制 mixture 含有 \(\tau=1\)。此时这一组的一个分量正好是 \(q_i\)，从而逐点有
 
 \[
-m(z)\ge \frac1Jq(z),\qquad 0\le w(z)\le J,
+m_i(z_i)\ge \frac1Jq_i(z_i),\qquad 0\le w_i(z_i)\le J,
 \]
 
-避免联合 importance weight 上溢。TensorBoard 另外记录 `train/importance_ess`。
+避免当前组 importance weight 上溢。TensorBoard 记录各组 ESS 的平均 `train/importance_ess`。
 
-当前实现采用可复现、固定的 \(\tau_j\)，没有实现论文中可选的每变量在线 dispersion 更新；它不影响固定 proposal 下估计器的无偏性。当前版本使用完整轨迹权重，数学上正确但可能比论文的逐变量 Rao–Blackwellized 权重方差更高。
+当前实现采用固定的 \(\tau_t\)，没有实现论文中可选的每变量在线 dispersion 更新。以上条件重采样是针对 NVAE 条件后验的额外构造；论文的 mean-field 公式不能直接移用。单个基准轨迹的前缀引入额外方差，组数多时计算开销很大。
 
 ## 4. GitHub 参考实现核查
 
@@ -132,11 +135,15 @@ python train.py ... --latent_distribution poisson --num_nf 0 \
   --poisson_gradient_estimator reinforce \
   --reinforce_num_samples 1 --score_baseline_decay 0.9
 
-# O-BBVI，2 个 proposal、每个 proposal 4 条轨迹
+# 逐组条件 O-BBVI，每组 2 个 proposal、每个 proposal 4 条轨迹
 python train.py ... --latent_distribution poisson --num_nf 0 \
   --poisson_gradient_estimator obbvi \
   --obbvi_taus 1.0,3.0 --obbvi_num_samples 8 \
+  --obbvi_objective analytic_kl \
   --score_baseline_decay 0.9
+
+# 若要使用逐样本 log q/p 版本，将上一条命令的目标切换为：
+# --obbvi_objective sampled
 
 # 原有 hard-forward / soft-backward 方法
 python train.py ... --latent_distribution poisson --num_nf 0 \
@@ -161,6 +168,6 @@ pytest -q
 5. O-BBVI proposal 的 \(\lambda^{1/\tau}\) 参数化、\(w\le J\) 上界及
    \(\mathbb E_m[(q/m)z]=\mathbb E_q[z]\) 恒等式；
 6. 全模型 REINFORCE surrogate 可反向传播；
-7. 全模型 O-BBVI 产生有限且有界的 DMIS 权重；
-8. 生成路径仍使用精确 Poisson 先验采样。
-
+7. 全模型条件 O-BBVI 固定前缀、只对当前组加权、两种目标产生有限梯度；
+8. 改变目标组计数时重新计算后续组的条件参数；小型双层例子中两种 score 公式均与精确目标的数值导数一致；
+9. 生成路径仍使用精确 Poisson 先验采样。

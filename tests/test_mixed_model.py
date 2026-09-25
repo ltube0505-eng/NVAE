@@ -118,15 +118,76 @@ def test_reinforce_model_builds_finite_score_surrogate():
     assert model._score_baseline_value is not None
 
 
-def test_obbvi_model_uses_bounded_dmis_weight():
+def test_obbvi_replays_prefix_and_uses_group_weight(monkeypatch):
     model = _poisson_model('obbvi').train()
-    model.set_obbvi_component(1)
     x = torch.bernoulli(torch.full((2, 1, 32, 32), 0.5))
-    logits, _, _, _, _ = model(x)
-    recon = -model.decoder_output(logits).log_prob(x)[:, :, 2:30, 2:30].sum(dim=[1, 2, 3])
-    objective, _, weight = model.score_function_objective(
-        recon, 1., model.score_baseline(recon))
+    model(x)
+    prefix = [z.detach().clone() for z in model._gradient_context['samples']]
+    sample_calls = []
+    original_sample = model._sample_latent
 
-    assert torch.isfinite(objective).all()
-    assert torch.isfinite(weight).all()
-    assert torch.max(weight) <= len(model.obbvi_taus) + 1e-5
+    def record_sample(dist, training_sample=False, proposal_group=False):
+        sample_calls.append(proposal_group)
+        return original_sample(dist, training_sample, proposal_group)
+
+    monkeypatch.setattr(model, '_sample_latent', record_sample)
+    for objective in ('sampled', 'analytic_kl'):
+        model.obbvi_objective = objective
+        for group in (0, 2):
+            sample_calls.clear()
+            model.set_obbvi_component(1)
+            logits, _, _, _, _ = model(x, prefix_samples=prefix, proposal_group=group)
+            context = model._gradient_context
+            assert sample_calls == [True] + [False] * (model.num_groups - group - 1)
+            assert all(torch.equal(context['samples'][j], prefix[j]) for j in range(group))
+            assert len(context['group_log_q']) == model.num_groups
+            assert len(context['group_kl']) == model.num_groups
+            recon = -model.decoder_output(logits).log_prob(x)[:, :, 2:30, 2:30].sum(dim=[1, 2, 3])
+            score, signal, weight = model.conditional_score_objective(
+                recon, 1., model.score_baseline(recon), group)
+            expected = torch.exp((context['group_log_q'][group] -
+                                  context['proposal_log_m']).float()).detach()
+            assert torch.allclose(weight, expected)
+            assert torch.isfinite(score).all() and torch.isfinite(signal).all()
+            assert torch.isfinite(weight).all()
+            assert torch.max(weight) <= len(model.obbvi_taus) + 1e-5
+            score.mean().backward()
+            assert any(p.grad is not None and torch.isfinite(p.grad).all()
+                       for p in model.enc_sampler.parameters())
+            model.zero_grad()
+
+
+def test_obbvi_analytic_kl_direct_gradient_without_reconstruction():
+    model = _poisson_model('obbvi').train()
+    x = torch.rand(2, 1, 32, 32)
+    model(x)
+    first_kl = model._gradient_context['group_kl'][0].mean()
+    first_kl.backward()
+    assert any(p.grad is not None and torch.isfinite(p.grad).all()
+               for p in model.enc_sampler[0].parameters())
+
+
+def test_obbvi_suffix_recomputes_conditional_parameters(monkeypatch):
+    model = _poisson_model('obbvi').train()
+    x = torch.rand(2, 1, 32, 32)
+    model(x)
+    prefix = [z.detach().clone() for z in model._gradient_context['samples']]
+    original_sample = model._sample_latent
+    observed_rates = []
+    forced_count = [0.]
+
+    def forced_proposal(dist, training_sample=False, proposal_group=False):
+        if proposal_group:
+            z = torch.full_like(dist.rate, forced_count[0])
+            return z, torch.stack([dist.proposal_log_p(z, tau)
+                                   for tau in model.obbvi_taus], dim=0)
+        observed_rates.append(dist.rate.detach().clone())
+        return original_sample(dist, training_sample, proposal_group)
+
+    monkeypatch.setattr(model, '_sample_latent', forced_proposal)
+    model(x, prefix_samples=prefix, proposal_group=2)
+    first_suffix_rate = observed_rates[0]
+    observed_rates.clear()
+    forced_count[0] = 5.
+    model(x, prefix_samples=prefix, proposal_group=2)
+    assert not torch.allclose(first_suffix_rate, observed_rates[0])
