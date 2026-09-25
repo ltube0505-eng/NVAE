@@ -139,11 +139,24 @@ class AutoEncoder(nn.Module):
             raise ValueError('score_baseline_decay must be in [0, 1).')
         self.reinforce_num_samples = int(getattr(args, 'reinforce_num_samples', 1))
         self.obbvi_num_samples = int(getattr(args, 'obbvi_num_samples', 8))
+        self.obbvi_baseline_samples = int(getattr(args, 'obbvi_baseline_samples', 4))
+        self.obbvi_objective = getattr(args, 'obbvi_objective', 'analytic_kl')
+        if self.obbvi_objective not in {'sampled', 'analytic_kl'}:
+            raise ValueError('Unknown O-BBVI objective: %s' % self.obbvi_objective)
+        self.kl_balance_mode = getattr(args, 'kl_balance_mode', 'original')
+        if self.kl_balance_mode not in {'original', 'shared_lagged'}:
+            raise ValueError('Unknown KL balance mode: %s' % self.kl_balance_mode)
+        self._previous_kl_for_balance = None
         if self.reinforce_num_samples < 1 or self.obbvi_num_samples < 1:
             raise ValueError('Gradient-estimator sample counts must be positive.')
+        if self.obbvi_baseline_samples < 1:
+            raise ValueError('--obbvi_baseline_samples must be positive.')
         if self.poisson_gradient_estimator == 'obbvi' and \
                 self.obbvi_num_samples % len(self.obbvi_taus) != 0:
             raise ValueError('--obbvi_num_samples must be divisible by the number of --obbvi_taus.')
+        if self.poisson_gradient_estimator == 'obbvi' and \
+                self.obbvi_baseline_samples % len(self.obbvi_taus) != 0:
+            raise ValueError('--obbvi_baseline_samples must be divisible by the number of --obbvi_taus.')
         self._score_baseline_value = None
         self._obbvi_component = 0
         self._gradient_context = None
@@ -153,6 +166,7 @@ class AutoEncoder(nn.Module):
         self.num_latent_per_group = args.num_latent_per_group   # number of latent vars. per group
         self.groups_per_scale = groups_per_scale(self.num_latent_scales, self.num_groups_per_scale, args.ada_groups,
                                                  minimum_groups=args.min_groups_per_scale)
+        self.num_groups = sum(self.groups_per_scale)
 
         if self.latent_distribution == 'mixed_poisson_gamma':
             if self.groups_per_scale != [4, 2]:
@@ -422,9 +436,11 @@ class AutoEncoder(nn.Module):
             raise ValueError('O-BBVI component index is out of range.')
         self._obbvi_component = int(component)
 
-    def _sample_latent(self, dist, training_sample=False):
+    def _sample_latent(self, dist, training_sample=False, proposal_group=False):
         if isinstance(dist, Poisson):
             estimator = self.poisson_gradient_estimator if training_sample else 'exact'
+            if estimator == 'obbvi' and not proposal_group:
+                estimator = 'exact'
             proposal_tau = None
             if estimator == 'obbvi':
                 proposal_tau = self.obbvi_taus[self._obbvi_component]
@@ -451,8 +467,8 @@ class AutoEncoder(nn.Module):
             self._score_baseline_value = decay * self._score_baseline_value + \
                 (1. - decay) * value
 
-    def score_function_objective(self, recon_loss, kl_coeff, baseline):
-        """Build the exact-sample REINFORCE/O-BBVI surrogate objective.
+    def score_function_objective(self, recon_loss, kl_coeff, baseline, group_coeffs=None):
+        """Build the exact-sample REINFORCE surrogate objective.
 
         The returned first tensor is differentiated. The sampled NELBO and
         importance weight are detached diagnostics. Proposal weights are also
@@ -460,24 +476,90 @@ class AutoEncoder(nn.Module):
         """
         if self._gradient_context is None:
             raise RuntimeError('forward() must run before requesting a score objective.')
+        if self.poisson_gradient_estimator != 'reinforce':
+            raise ValueError('Use conditional_score_objective for O-BBVI.')
         log_q = self._gradient_context['log_q']
-        log_p = self._gradient_context['log_p']
-        sampled_nelbo = recon_loss.float() + float(kl_coeff) * (log_q - log_p)
+        group_log_q = self._gradient_context['group_log_q']
+        group_log_p = self._gradient_context['group_log_p']
+        if group_coeffs is None:
+            group_coeffs = recon_loss.new_ones(len(group_log_q))
+        weighted_kl_sample = sum(group_coeffs[j] * (q - p)
+                                 for j, (q, p) in enumerate(zip(group_log_q, group_log_p)))
+        weighted_prior = sum(group_coeffs[j] * p for j, p in enumerate(group_log_p))
+        sampled_nelbo = recon_loss.float() + float(kl_coeff) * weighted_kl_sample
 
-        if self.poisson_gradient_estimator == 'obbvi':
-            log_proposal = self._gradient_context['log_proposal']
-            importance_weight = torch.exp(log_q - log_proposal).detach()
-        else:
-            importance_weight = torch.ones_like(sampled_nelbo)
+        importance_weight = torch.ones_like(sampled_nelbo)
 
         centered_signal = sampled_nelbo.detach() - baseline
         # Direct gradients train p_theta(x,z); the likelihood-ratio term trains
         # every parameter that participates in q_phi(z|x).
-        generative = importance_weight * (recon_loss.float() - float(kl_coeff) * log_p)
+        generative = importance_weight * (recon_loss.float() - float(kl_coeff) * weighted_prior)
         inference = importance_weight * centered_signal * log_q
         return generative + inference, sampled_nelbo.detach(), importance_weight
 
-    def forward(self, x):
+    def conditional_score_objective(self, recon_loss, kl_coeff, baseline, group_index,
+                                    group_coeffs=None):
+        """One conditional proposal trajectory's inference score contribution.
+
+        The caller averages equal numbers of samples from each tau for each
+        group. The prefix is reused, while the suffix is sampled afresh from q.
+        All values multiplying the group score are held fixed by autograd.
+        """
+        context = self._gradient_context
+        if context is None or context['proposal_group'] != group_index:
+            raise RuntimeError('A matching conditional proposal forward pass is required.')
+        log_q = context['group_log_q'][group_index]
+        if group_coeffs is None:
+            group_coeffs = recon_loss.new_ones(len(context['group_log_q']))
+        log_m = context['proposal_log_m']
+        weight = torch.exp((log_q - log_m).float()).detach()
+        if self.obbvi_objective == 'analytic_kl':
+            suffix = sum(group_coeffs[j] * context['group_kl'][j]
+                         for j in range(group_index + 1, len(context['group_kl'])))
+        else:
+            suffix = sum(group_coeffs[j] * (context['group_log_q'][j] -
+                                             context['group_log_p'][j])
+                         for j in range(group_index, len(context['group_log_q'])))
+        signal = (recon_loss.float() + float(kl_coeff) * suffix).detach()
+        score = weight * (signal - baseline.detach()) * log_q
+        return score, signal, weight
+
+    def conditional_poisson_score_norm(self, group_index):
+        """Squared score with respect to the selected Poisson group's log rates."""
+        context = self._gradient_context
+        if context is None or context['proposal_group'] != group_index:
+            raise RuntimeError('A matching conditional proposal forward pass is required.')
+        z = context['samples'][group_index].detach().float()
+        rate = context['proposal_rate'].detach().float()
+        return torch.sum((z - rate) ** 2, dim=[1, 2, 3])
+
+    @staticmethod
+    def conditional_poisson_baseline(signals, weights, score_norms):
+        """Per-example conditional DMIS control variate from independent pilots.
+
+        The caller must supply pilot trajectories independent of the samples
+        used for the gradient, with equal allocation across proposal components.
+        This is an empirical mixture-moment variance proxy for the log-rate
+        score coordinates. Fixed component allocation can have a different
+        exact minimum-variance baseline.
+        """
+        signal = torch.stack(signals).detach().float()
+        weight = torch.stack(weights).detach().float()
+        score_norm = torch.stack(score_norms).detach().float()
+        importance = weight.square() * score_norm
+        numerator = torch.sum(importance * signal, dim=0)
+        denominator = torch.sum(importance, dim=0)
+        return torch.where(denominator > 0., numerator / denominator.clamp_min(1e-12),
+                           torch.zeros_like(numerator))
+
+    def forward(self, x, prefix_samples=None, proposal_group=None):
+        if proposal_group is not None:
+            if not self.training or self.poisson_gradient_estimator != 'obbvi':
+                raise ValueError('Conditional proposals require training O-BBVI.')
+            if prefix_samples is None or not 0 <= proposal_group < self.num_groups:
+                raise ValueError('A valid proposal group and base trajectory are required.')
+            if len(prefix_samples) != self.num_groups:
+                raise ValueError('Base trajectory must contain every latent group.')
         s = self.stem(2 * x - 1.0)
 
         # perform pre-processing
@@ -502,7 +584,14 @@ class AutoEncoder(nn.Module):
         ftr = self.enc0(s)                            # this reduces the channel dimension
         param0 = self.enc_sampler[idx_dec](ftr)
         dist = self._latent_from_param(idx_dec, param0)   # first approximate posterior
-        z, proposal_log_probs = self._sample_latent(dist, training_sample=self.training)
+        if proposal_group is not None and 0 < proposal_group:
+            z = prefix_samples[0].detach()
+            proposal_log_probs = None
+        else:
+            z, proposal_log_probs = self._sample_latent(
+                dist, training_sample=self.training,
+                proposal_group=proposal_group == 0)
+        all_z = [z]
         log_q_conv = dist.log_p(z)
 
         # apply normalizing flows
@@ -531,75 +620,92 @@ class AutoEncoder(nn.Module):
         batch_size = z.size(0)
         s = s.expand(batch_size, -1, -1, -1)
         for cell in self.dec_tower:
-            if cell.cell_type == 'combiner_dec':
-                if idx_dec > 0:
-                    # form prior
-                    param = self.dec_sampler[idx_dec - 1](s)
-                    prior_param = param
-                    prior_dist = self._latent_from_param(idx_dec, prior_param)
+            # Only the selected q_i score needs a graph on a proposal trajectory.
+            with torch.set_grad_enabled(torch.is_grad_enabled() and
+                                        (proposal_group is None or idx_dec <= proposal_group)):
+                if cell.cell_type == 'combiner_dec':
+                    if idx_dec > 0:
+                        # form prior
+                        param = self.dec_sampler[idx_dec - 1](s)
+                        prior_param = param
+                        prior_dist = self._latent_from_param(idx_dec, prior_param)
 
-                    # form encoder
-                    ftr = combiner_cells_enc[idx_dec - 1](combiner_cells_s[idx_dec - 1], s)
-                    param = self.enc_sampler[idx_dec](ftr)
-                    dist = self._latent_from_param(idx_dec, param, residual_param=prior_param)
-                    z, proposal_log_probs = self._sample_latent(dist, training_sample=self.training)
-                    log_q_conv = dist.log_p(z)
-                    # apply NF
-                    for n in range(self.num_flows):
-                        z, log_det = self.nf_cells[nf_offset + n](z, ftr)
-                        log_q_conv -= log_det
-                    nf_offset += self.num_flows
-                    all_log_q.append(log_q_conv)
-                    all_q.append(dist)
-                    if proposal_log_probs is not None:
-                        all_proposal_log_probs.append(proposal_log_probs)
+                        # form encoder
+                        ftr = combiner_cells_enc[idx_dec - 1](combiner_cells_s[idx_dec - 1], s)
+                        param = self.enc_sampler[idx_dec](ftr)
+                        dist = self._latent_from_param(idx_dec, param, residual_param=prior_param)
+                        if proposal_group is not None and idx_dec < proposal_group:
+                            z = prefix_samples[idx_dec].detach()
+                            proposal_log_probs = None
+                        else:
+                            z, proposal_log_probs = self._sample_latent(
+                                dist, training_sample=self.training,
+                                proposal_group=proposal_group == idx_dec)
+                        all_z.append(z)
+                        log_q_conv = dist.log_p(z)
+                        # apply NF
+                        for n in range(self.num_flows):
+                            z, log_det = self.nf_cells[nf_offset + n](z, ftr)
+                            log_q_conv -= log_det
+                        nf_offset += self.num_flows
+                        all_log_q.append(log_q_conv)
+                        all_q.append(dist)
+                        if proposal_log_probs is not None:
+                            all_proposal_log_probs.append(proposal_log_probs)
 
-                    # evaluate log_p(z)
-                    dist = prior_dist
-                    log_p_conv = dist.log_p(z)
-                    all_p.append(dist)
-                    all_log_p.append(log_p_conv)
+                        # evaluate log_p(z)
+                        dist = prior_dist
+                        log_p_conv = dist.log_p(z)
+                        all_p.append(dist)
+                        all_log_p.append(log_p_conv)
 
-                # 'combiner_dec'
-                s = cell(s, z)
-                idx_dec += 1
-            else:
-                s = cell(s)
+                    # 'combiner_dec'
+                    s = cell(s, z)
+                    idx_dec += 1
+                else:
+                    s = cell(s)
 
         if self.vanilla_vae:
-            s = self.stem_decoder(z)
+            with torch.set_grad_enabled(torch.is_grad_enabled() and proposal_group is None):
+                s = self.stem_decoder(z)
 
-        for cell in self.post_process:
-            s = cell(s)
-
-        logits = self.image_conditional(s)
+        with torch.set_grad_enabled(torch.is_grad_enabled() and proposal_group is None):
+            for cell in self.post_process:
+                s = cell(s)
+            logits = self.image_conditional(s)
 
         # compute kl
         kl_all = []
         kl_diag = []
+        group_log_q, group_log_p = [], []
         log_p, log_q = 0., 0.
         for q, p, log_q_conv, log_p_conv in zip(all_q, all_p, all_log_q, all_log_p):
-            if self.with_nf:
-                kl_per_var = log_q_conv - log_p_conv
-            else:
-                kl_per_var = q.kl(p)
+            with torch.set_grad_enabled(torch.is_grad_enabled() and proposal_group is None):
+                if self.with_nf:
+                    kl_per_var = log_q_conv - log_p_conv
+                else:
+                    kl_per_var = q.kl(p)
 
             kl_diag.append(torch.mean(torch.sum(kl_per_var, dim=[2, 3]), dim=0))
             kl_all.append(torch.sum(kl_per_var, dim=[1, 2, 3]))
-            log_q += torch.sum(log_q_conv, dim=[1, 2, 3])
-            log_p += torch.sum(log_p_conv, dim=[1, 2, 3])
+            group_log_q.append(torch.sum(log_q_conv, dim=[1, 2, 3]))
+            group_log_p.append(torch.sum(log_p_conv, dim=[1, 2, 3]))
+            log_q += group_log_q[-1]
+            log_p += group_log_p[-1]
 
-        self._gradient_context = {'log_q': log_q.float(), 'log_p': log_p.float()}
-        if self.training and self.poisson_gradient_estimator == 'obbvi':
-            if len(all_proposal_log_probs) != len(all_q):
-                raise RuntimeError('O-BBVI requires every latent group to be Poisson.')
-            component_log_probs = None
-            for proposal_log_probs in all_proposal_log_probs:
-                group_log_probs = torch.sum(proposal_log_probs.float(), dim=[2, 3, 4])
-                component_log_probs = group_log_probs if component_log_probs is None \
-                    else component_log_probs + group_log_probs
-            self._gradient_context['log_proposal'] = torch.logsumexp(
+        self._gradient_context = {
+            'log_q': log_q.float(), 'log_p': log_p.float(),
+            'group_log_q': group_log_q, 'group_log_p': group_log_p,
+            'group_kl': kl_all, 'samples': all_z, 'proposal_group': proposal_group,
+        }
+        if proposal_group is not None:
+            if len(all_proposal_log_probs) != 1:
+                raise RuntimeError('Exactly one group must use the proposal.')
+            component_log_probs = torch.sum(
+                all_proposal_log_probs[0].float(), dim=[2, 3, 4])
+            self._gradient_context['proposal_log_m'] = torch.logsumexp(
                 component_log_probs, dim=0) - np.log(float(len(self.obbvi_taus)))
+            self._gradient_context['proposal_rate'] = all_q[proposal_group].rate.detach()
 
         return logits, log_q, log_p, kl_all, kl_diag
 
