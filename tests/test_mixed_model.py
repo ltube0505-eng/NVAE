@@ -51,6 +51,7 @@ def _poisson_model(estimator='straight_through'):
     args.poisson_gradient_estimator = estimator
     args.obbvi_taus = '1.0,3.0'
     args.obbvi_num_samples = 2
+    args.obbvi_baseline_samples = 2
     args.reinforce_num_samples = 1
     args.score_baseline_decay = 0.9
     model = AutoEncoder(args, None, utils.get_arch_cells('res_elu'))
@@ -175,6 +176,27 @@ def test_obbvi_analytic_kl_direct_gradient_without_reconstruction():
     first_kl.backward()
     assert any(p.grad is not None and torch.isfinite(p.grad).all()
                for p in model.enc_sampler[0].parameters())
+
+
+def test_conditional_poisson_baseline_uses_pilot_score_and_dmis_weights():
+    signals = [torch.tensor([2., 8.]), torch.tensor([10., 4.])]
+    weights = [torch.tensor([1., 2.]), torch.tensor([2., 1.])]
+    score_norms = [torch.tensor([4., 0.]), torch.tensor([1., 0.])]
+    baseline = AutoEncoder.conditional_poisson_baseline(signals, weights, score_norms)
+    assert torch.allclose(baseline, torch.tensor([6., 0.]))
+    assert not baseline.requires_grad
+
+
+def test_conditional_poisson_score_norm_uses_selected_group_rate():
+    model = _poisson_model('obbvi').train()
+    x = torch.rand(2, 1, 32, 32)
+    model(x)
+    prefix = [z.detach() for z in model._gradient_context['samples']]
+    model.set_obbvi_component(0)
+    model(x, prefix_samples=prefix, proposal_group=1)
+    context = model._gradient_context
+    expected = ((context['samples'][1] - context['proposal_rate']) ** 2).sum(dim=[1, 2, 3])
+    assert torch.allclose(model.conditional_poisson_score_norm(1), expected)
 
 
 def test_obbvi_suffix_recomputes_conditional_parameters(monkeypatch):
