@@ -198,10 +198,28 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
                     nelbo_batch = (recon_loss + beta * sum(
                         group_coeffs[j] * (group_q[j] - group_p[j])
                         for j in range(model.num_groups))).detach()
-                baseline = model.score_baseline(x)
-                score_terms, signals, group_ess = [], [], []
+                score_terms, group_ess = [], []
                 num_components = len(model.obbvi_taus)
                 for group in range(model.num_groups):
+                    # Independent pilot draws estimate a separate baseline for
+                    # q_i(z_i | x, z_<i). Neither the pilot signal nor its
+                    # Poisson score is reused in the gradient estimate.
+                    pilot_signals, pilot_weights, pilot_norms = [], [], []
+                    with torch.no_grad():
+                        for pilot in range(model.obbvi_baseline_samples):
+                            model.set_obbvi_component(pilot % num_components)
+                            pilot_logits, _, _, _, _ = model(
+                                x, prefix_samples=prefix_samples, proposal_group=group)
+                            pilot_recon = utils.reconstruction_loss(
+                                model.decoder_output(pilot_logits), x, crop=model.crop_output)
+                            _, pilot_signal, pilot_weight = model.conditional_score_objective(
+                                pilot_recon, kl_coeff, x.new_zeros(x.size(0)), group,
+                                group_coeffs=group_coeffs)
+                            pilot_signals.append(pilot_signal)
+                            pilot_weights.append(pilot_weight)
+                            pilot_norms.append(model.conditional_poisson_score_norm(group))
+                    baseline = model.conditional_poisson_baseline(
+                        pilot_signals, pilot_weights, pilot_norms)
                     group_scores, group_weights = [], []
                     for sample_index in range(model.obbvi_num_samples):
                         model.set_obbvi_component(sample_index % num_components)
@@ -215,13 +233,11 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
                             group_coeffs=group_coeffs)
                         group_scores.append(score)
                         group_weights.append(weight)
-                        signals.append(signal)
                     score_terms.append(torch.stack(group_scores).mean(dim=0))
                     weight_stack = torch.stack(group_weights)
                     group_ess.append(torch.mean(
                         torch.sum(weight_stack, dim=0) ** 2 /
                         torch.sum(weight_stack ** 2, dim=0).clamp_min(1e-8)))
-                model.update_score_baseline(signals)
                 loss = torch.mean(direct + sum(score_terms))
                 importance_ess = torch.stack(group_ess).mean()
                 _, _, kl_vals = utils.kl_balancer(kl_all, kl_coeff, kl_balance=False)
@@ -516,6 +532,8 @@ if __name__ == '__main__':
                         help='comma-separated O-BBVI Poisson proposal dispersions; include 1')
     parser.add_argument('--obbvi_num_samples', type=int, default=8,
                         help='conditional proposal samples per group; divisible by number of taus')
+    parser.add_argument('--obbvi_baseline_samples', type=int, default=4,
+                        help='independent conditional Poisson pilot samples per group; divisible by number of taus')
     parser.add_argument('--obbvi_objective', type=str, default='analytic_kl',
                         choices=['sampled', 'analytic_kl'],
                         help='sampled log q/p or per-group analytic conditional Poisson KL')
