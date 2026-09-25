@@ -168,6 +168,16 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
                                       args.kl_const_portion * args.num_total_iter, args.kl_const_coeff)
             score_estimator = model.poisson_gradient_estimator in {'reinforce', 'obbvi'}
             importance_ess = None
+            if model.kl_balance_mode == 'shared_lagged' and kl_coeff < 1. and \
+                    model._previous_kl_for_balance is not None:
+                # A previous minibatch makes coefficients independent of every
+                # discrete sample used by the current score estimator.
+                _, group_coeffs, _ = utils.kl_balancer(
+                    model._previous_kl_for_balance, kl_coeff,
+                    kl_balance=True, alpha_i=alpha_i)
+                group_coeffs = group_coeffs.detach()
+            else:
+                group_coeffs = alpha_i.new_ones(model.num_groups)
 
             if model.poisson_gradient_estimator == 'obbvi' and model.latent_distribution == 'poisson':
                 # One target-q trajectory supplies unbiased direct derivatives.
@@ -177,11 +187,17 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
                 recon_loss = utils.reconstruction_loss(output, x, crop=model.crop_output)
                 beta = float(kl_coeff)
                 if model.obbvi_objective == 'analytic_kl':
-                    direct = recon_loss + beta * sum(kl_all)
+                    direct = recon_loss + beta * sum(
+                        group_coeffs[j] * kl_all[j] for j in range(model.num_groups))
                     nelbo_batch = direct.detach()
                 else:
-                    direct = recon_loss - beta * log_p
-                    nelbo_batch = (recon_loss + beta * (log_q - log_p)).detach()
+                    group_q = model._gradient_context['group_log_q']
+                    group_p = model._gradient_context['group_log_p']
+                    direct = recon_loss - beta * sum(
+                        group_coeffs[j] * group_p[j] for j in range(model.num_groups))
+                    nelbo_batch = (recon_loss + beta * sum(
+                        group_coeffs[j] * (group_q[j] - group_p[j])
+                        for j in range(model.num_groups))).detach()
                 baseline = model.score_baseline(x)
                 score_terms, signals, group_ess = [], [], []
                 num_components = len(model.obbvi_taus)
@@ -195,7 +211,8 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
                         proposal_recon = utils.reconstruction_loss(
                             proposal_output, x, crop=model.crop_output)
                         score, signal, weight = model.conditional_score_objective(
-                            proposal_recon, kl_coeff, baseline, group)
+                            proposal_recon, kl_coeff, baseline, group,
+                            group_coeffs=group_coeffs)
                         group_scores.append(score)
                         group_weights.append(weight)
                         signals.append(signal)
@@ -207,8 +224,8 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
                 model.update_score_baseline(signals)
                 loss = torch.mean(direct + sum(score_terms))
                 importance_ess = torch.stack(group_ess).mean()
-                _, kl_coeffs, kl_vals = utils.kl_balancer(
-                    kl_all, kl_coeff, kl_balance=False)
+                _, _, kl_vals = utils.kl_balancer(kl_all, kl_coeff, kl_balance=False)
+                kl_coeffs = group_coeffs
             elif score_estimator:
                 num_gradient_samples = model.reinforce_num_samples
                 baseline = model.score_baseline(x)
@@ -219,7 +236,8 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
                     output = model.decoder_output(logits)
                     recon_loss_i = utils.reconstruction_loss(output, x, crop=model.crop_output)
                     objective_i, sampled_nelbo_i, importance_weight_i = \
-                        model.score_function_objective(recon_loss_i, kl_coeff, baseline)
+                        model.score_function_objective(
+                            recon_loss_i, kl_coeff, baseline, group_coeffs=group_coeffs)
                     objectives.append(objective_i)
                     sampled_nelbos.append(sampled_nelbo_i)
                     importance_weights.append(importance_weight_i)
@@ -243,15 +261,25 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
                           for group in range(len(kl_samples[0]))]
                 kl_diag = [torch.mean(torch.stack([sample[group] for sample in kl_diag_samples]), dim=0)
                            for group in range(len(kl_diag_samples[0]))]
-                _, kl_coeffs, kl_vals = utils.kl_balancer(kl_all, kl_coeff, kl_balance=False)
+                _, _, kl_vals = utils.kl_balancer(kl_all, kl_coeff, kl_balance=False)
+                kl_coeffs = group_coeffs
             else:
                 logits, log_q, log_p, kl_all, kl_diag = model(x)
                 output = model.decoder_output(logits)
                 recon_loss = utils.reconstruction_loss(output, x, crop=model.crop_output)
-                balanced_kl, kl_coeffs, kl_vals = utils.kl_balancer(
-                    kl_all, kl_coeff, kl_balance=True, alpha_i=alpha_i)
+                if model.kl_balance_mode == 'shared_lagged':
+                    balanced_kl = kl_coeff * sum(
+                        group_coeffs[j] * kl_all[j] for j in range(model.num_groups))
+                    kl_coeffs = group_coeffs
+                    kl_vals = torch.stack(kl_all, dim=1).mean(dim=0)
+                else:
+                    balanced_kl, kl_coeffs, kl_vals = utils.kl_balancer(
+                        kl_all, kl_coeff, kl_balance=True, alpha_i=alpha_i)
                 nelbo_batch = recon_loss + balanced_kl
                 loss = torch.mean(nelbo_batch)
+
+            if model.kl_balance_mode == 'shared_lagged':
+                model._previous_kl_for_balance = [k.detach() for k in kl_all]
 
             reported_nelbo = torch.mean(nelbo_batch.detach())
             norm_loss = model.spectral_norm_parallel()
@@ -491,6 +519,9 @@ if __name__ == '__main__':
     parser.add_argument('--obbvi_objective', type=str, default='analytic_kl',
                         choices=['sampled', 'analytic_kl'],
                         help='sampled log q/p or per-group analytic conditional Poisson KL')
+    parser.add_argument('--kl_balance_mode', type=str, default='original',
+                        choices=['original', 'shared_lagged'],
+                        help='shared_lagged applies previous-minibatch NVAE KL weights to every estimator')
     parser.add_argument('--ada_groups', action='store_true', default=False,
                         help='Settings this to true will set different number of groups per scale.')
     parser.add_argument('--min_groups_per_scale', type=int, default=1,

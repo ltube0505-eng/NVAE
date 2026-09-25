@@ -142,6 +142,10 @@ class AutoEncoder(nn.Module):
         self.obbvi_objective = getattr(args, 'obbvi_objective', 'analytic_kl')
         if self.obbvi_objective not in {'sampled', 'analytic_kl'}:
             raise ValueError('Unknown O-BBVI objective: %s' % self.obbvi_objective)
+        self.kl_balance_mode = getattr(args, 'kl_balance_mode', 'original')
+        if self.kl_balance_mode not in {'original', 'shared_lagged'}:
+            raise ValueError('Unknown KL balance mode: %s' % self.kl_balance_mode)
+        self._previous_kl_for_balance = None
         if self.reinforce_num_samples < 1 or self.obbvi_num_samples < 1:
             raise ValueError('Gradient-estimator sample counts must be positive.')
         if self.poisson_gradient_estimator == 'obbvi' and \
@@ -457,7 +461,7 @@ class AutoEncoder(nn.Module):
             self._score_baseline_value = decay * self._score_baseline_value + \
                 (1. - decay) * value
 
-    def score_function_objective(self, recon_loss, kl_coeff, baseline):
+    def score_function_objective(self, recon_loss, kl_coeff, baseline, group_coeffs=None):
         """Build the exact-sample REINFORCE surrogate objective.
 
         The returned first tensor is differentiated. The sampled NELBO and
@@ -469,19 +473,26 @@ class AutoEncoder(nn.Module):
         if self.poisson_gradient_estimator != 'reinforce':
             raise ValueError('Use conditional_score_objective for O-BBVI.')
         log_q = self._gradient_context['log_q']
-        log_p = self._gradient_context['log_p']
-        sampled_nelbo = recon_loss.float() + float(kl_coeff) * (log_q - log_p)
+        group_log_q = self._gradient_context['group_log_q']
+        group_log_p = self._gradient_context['group_log_p']
+        if group_coeffs is None:
+            group_coeffs = recon_loss.new_ones(len(group_log_q))
+        weighted_kl_sample = sum(group_coeffs[j] * (q - p)
+                                 for j, (q, p) in enumerate(zip(group_log_q, group_log_p)))
+        weighted_prior = sum(group_coeffs[j] * p for j, p in enumerate(group_log_p))
+        sampled_nelbo = recon_loss.float() + float(kl_coeff) * weighted_kl_sample
 
         importance_weight = torch.ones_like(sampled_nelbo)
 
         centered_signal = sampled_nelbo.detach() - baseline
         # Direct gradients train p_theta(x,z); the likelihood-ratio term trains
         # every parameter that participates in q_phi(z|x).
-        generative = importance_weight * (recon_loss.float() - float(kl_coeff) * log_p)
+        generative = importance_weight * (recon_loss.float() - float(kl_coeff) * weighted_prior)
         inference = importance_weight * centered_signal * log_q
         return generative + inference, sampled_nelbo.detach(), importance_weight
 
-    def conditional_score_objective(self, recon_loss, kl_coeff, baseline, group_index):
+    def conditional_score_objective(self, recon_loss, kl_coeff, baseline, group_index,
+                                    group_coeffs=None):
         """One conditional proposal trajectory's inference score contribution.
 
         The caller averages equal numbers of samples from each tau for each
@@ -492,15 +503,17 @@ class AutoEncoder(nn.Module):
         if context is None or context['proposal_group'] != group_index:
             raise RuntimeError('A matching conditional proposal forward pass is required.')
         log_q = context['group_log_q'][group_index]
+        if group_coeffs is None:
+            group_coeffs = recon_loss.new_ones(len(context['group_log_q']))
         log_m = context['proposal_log_m']
         weight = torch.exp((log_q - log_m).float()).detach()
         if self.obbvi_objective == 'analytic_kl':
-            suffix = sum(context['group_kl'][group_index + 1:]) if \
-                group_index + 1 < len(context['group_kl']) else 0.
+            suffix = sum(group_coeffs[j] * context['group_kl'][j]
+                         for j in range(group_index + 1, len(context['group_kl'])))
         else:
-            suffix = sum(q - p for q, p in zip(
-                context['group_log_q'][group_index:],
-                context['group_log_p'][group_index:]))
+            suffix = sum(group_coeffs[j] * (context['group_log_q'][j] -
+                                             context['group_log_p'][j])
+                         for j in range(group_index, len(context['group_log_q'])))
         signal = (recon_loss.float() + float(kl_coeff) * suffix).detach()
         score = weight * (signal - baseline.detach()) * log_q
         return score, signal, weight

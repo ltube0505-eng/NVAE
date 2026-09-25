@@ -143,8 +143,18 @@ def test_obbvi_replays_prefix_and_uses_group_weight(monkeypatch):
             assert len(context['group_log_q']) == model.num_groups
             assert len(context['group_kl']) == model.num_groups
             recon = -model.decoder_output(logits).log_prob(x)[:, :, 2:30, 2:30].sum(dim=[1, 2, 3])
+            coefficients = recon.new_tensor([1.7] + [0.6] * (model.num_groups - 1))
             score, signal, weight = model.conditional_score_objective(
-                recon, 1., model.score_baseline(recon), group)
+                recon, 1., model.score_baseline(recon), group,
+                group_coeffs=coefficients)
+            if objective == 'analytic_kl':
+                suffix = sum(coefficients[j] * context['group_kl'][j]
+                             for j in range(group + 1, model.num_groups))
+            else:
+                suffix = sum(coefficients[j] * (context['group_log_q'][j] -
+                                                context['group_log_p'][j])
+                             for j in range(group, model.num_groups))
+            assert torch.allclose(signal, (recon + suffix).detach())
             expected = torch.exp((context['group_log_q'][group] -
                                   context['proposal_log_m']).float()).detach()
             assert torch.allclose(weight, expected)

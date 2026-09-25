@@ -60,7 +60,7 @@ L_{\rm score}=
 
 其中 \(b\) 是仅由此前 minibatch 更新的指数移动平均。当前批次先使用旧 baseline，再更新 baseline，因此 baseline 与当前抽样独立，不改变 score estimator 的期望。
 
-`reinforce` 和 `obbvi --obbvi_objective sampled` 的直接导数不加入解析 KL；解析 KL 用于监控。`obbvi --obbvi_objective analytic_kl` 对解析 KL 求直接导数，同时将后续 KL 值纳入各组 score 系数。KL balancing 只保留在 `relaxed`/`straight_through` 模式；score 模式使用统一标量 KL warm-up 系数 \(\beta\)。
+`reinforce` 和 `obbvi --obbvi_objective sampled` 的直接导数不加入解析 KL；解析 KL 用于监控。`obbvi --obbvi_objective analytic_kl` 对解析 KL 求直接导数，同时将后续 KL 值纳入各组 score 系数。默认 `--kl_balance_mode original` 保留原行为：路径梯度模式使用当前批次的 KL balancing，score 模式仅使用统一标量 KL warm-up 系数 \(\beta\)。若要比较相同 KL 权重下的各估计器，可统一启用下文的 `shared_lagged`。
 
 ## 3. 沿 NVAE 顺序的逐组条件 proposal
 
@@ -100,6 +100,12 @@ m_i(z_i\mid x,z_{<i})=\frac1J\sum_{t=1}^{J}r_{it}(z_i\mid x,z_{<i}),
 其直接导数另用一条基准后验轨迹上的 \(R_{\rm loss}-\beta\sum_j\log p_j\) 估计。`--obbvi_objective analytic_kl`（默认）使用同一组条件 proposal，但把全部组的 KL 积分为解析式 \(K_j(z_{<j})\)。这时组 \(i\) 的 score 系数变成 \(R_{\rm loss}+\beta\sum_{j>i}K_j-b\)；基准轨迹的直接导数是 \(R_{\rm loss}+\beta\sum_j K_j\)，包含每个 \(K_i\) 对参数的直接导数。对于最小化符号，以上所有符号与最大化 ELBO 的公式相反。Poisson 本组 KL 为 \(\sum_d[\lambda^q_d\log(\lambda^q_d/\lambda^p_d)+\lambda^p_d-\lambda^q_d]\)。
 
 基准轨迹的离散样本与复用的前缀均从 autograd 图分离；每个组的 score、proposal 权重、KL 值和 baseline 在 score 系数内固定。基准轨迹的解析 KL 本身正常反传。直接导数**只计算一次**，逐组 score 求和。默认每组 `--obbvi_taus 1.0,3.0`、`--obbvi_num_samples 8`，样本数必须能被 tau 数整除。训练代价约为 \(1+G\times S\) 次前向传播，早期组需重算最长的后缀。
+
+### 跨估计器使用相同的 KL balancing
+
+启用 `--kl_balance_mode shared_lagged` 后，所有估计器都使用相同的 NVAE `kl_balancer` 公式（同一 `alpha_i`、KL warm-up 系数、归一化方式）；只用**上一 minibatch** 的解析 group KL 计算本批次系数 \(c_j\)，然后将它们固定。第一批没有历史值时取 \(c_j=1\)；当 \(\beta=1\) 时，与原 NVAE 一样取 \(c_j=1\)。该模式会改变原有路径梯度模式在 warm-up 期间使用当前批次系数的细节，因此比较实验需要四种估计器**全部**使用此选项。
+
+固定 \(c_j\) 后，训练中的 KL 部分是 \(\beta\sum_j c_j K_j\)。`sampled`/REINFORCE 的逐样本 KL 和 prior 的直接梯度均逐组乘 \(c_j\)；解析 KL O-BBVI 的第 \(i\) 组 score 使用 \(\beta\sum_{j>i}c_jK_j\)，基准轨迹的直接导数使用 \(\beta\sum_j c_j\nabla K_j\)。若从**当前**轨迹计算 \(c_j\) 再用于 score，它可能依赖所抽出的离散 latent，简单地 `detach()` 不能保证上述 score 推导成立。上一批系数解决这一依赖；它和常见的 stop-gradient KL balancing 一样仍是动态训练启发式，而不是对固定原始 ELBO 的无偏梯度。用于报告模型质量的评估 NLL 保持不变；warm-up 期间的训练损失不再直接是标准 NELBO。
 
 配置强制 mixture 含有 \(\tau=1\)。此时这一组的一个分量正好是 \(q_i\)，从而逐点有
 
@@ -145,6 +151,9 @@ python train.py ... --latent_distribution poisson --num_nf 0 \
 # 若要使用逐样本 log q/p 版本，将上一条命令的目标切换为：
 # --obbvi_objective sampled
 
+# 若要按相同 KL balancing 方案比较四种估计器，在每条训练命令均追加：
+# --kl_balance_mode shared_lagged
+
 # 原有 hard-forward / soft-backward 方法
 python train.py ... --latent_distribution poisson --num_nf 0 \
   --poisson_gradient_estimator straight_through \
@@ -169,5 +178,5 @@ pytest -q
    \(\mathbb E_m[(q/m)z]=\mathbb E_q[z]\) 恒等式；
 6. 全模型 REINFORCE surrogate 可反向传播；
 7. 全模型条件 O-BBVI 固定前缀、只对当前组加权、两种目标产生有限梯度；
-8. 改变目标组计数时重新计算后续组的条件参数；小型双层例子中两种 score 公式均与精确目标的数值导数一致；
+8. 改变目标组计数时重新计算后续组的条件参数；小型双层例子中两种 score 公式在均匀及非均匀固定 KL 权重下均与精确目标的数值导数一致；
 9. 生成路径仍使用精确 Poisson 先验采样。

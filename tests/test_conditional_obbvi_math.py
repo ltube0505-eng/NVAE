@@ -12,7 +12,7 @@ def kl(rate_q, rate_p):
     return rate_q * math.log(rate_q / rate_p) + rate_p - rate_q
 
 
-def expectation(phi, psi, beta):
+def expectation(phi, psi, beta, coefficients):
     a = math.exp(phi)
     total = 0.
     for k in range(19):
@@ -22,11 +22,12 @@ def expectation(phi, psi, beta):
         for v in range(65):
             q = poisson(k, a) * poisson(v, b)
             reconstruction = (v - 2.) ** 2 / 7.
-            total += q * (reconstruction + beta * (kl(a, p1) + kl(b, p2)))
+            total += q * (reconstruction + beta * (
+                coefficients[0] * kl(a, p1) + coefficients[1] * kl(b, p2)))
     return total
 
 
-def conditional_scores(phi, psi, beta, analytic):
+def conditional_scores(phi, psi, beta, analytic, coefficients):
     a = math.exp(phi)
     score1 = score2 = direct1 = direct2 = 0.
     for k in range(19):
@@ -45,15 +46,16 @@ def conditional_scores(phi, psi, beta, analytic):
             reconstruction = (v - 2.) ** 2 / 7.
             q = q1 * q2
             if analytic:
-                signal1 = reconstruction + beta * kl(b, p2)
+                signal1 = reconstruction + beta * coefficients[1] * kl(b, p2)
                 signal2 = reconstruction
-                direct1 += q * beta * a * math.log(a / p1)
-                direct2 += q * beta * b * math.log(b / p2)
+                direct1 += q * beta * coefficients[0] * a * math.log(a / p1)
+                direct2 += q * beta * coefficients[1] * b * math.log(b / p2)
             else:
                 l1 = math.log(q1 / poisson(k, p1))
                 l2 = math.log(q2 / poisson(v, p2))
-                signal1 = reconstruction + beta * (l1 + l2)
-                signal2 = reconstruction + beta * l2
+                signal1 = reconstruction + beta * (
+                    coefficients[0] * l1 + coefficients[1] * l2)
+                signal2 = reconstruction + beta * coefficients[1] * l2
             # m1*q2*(q1/m1) and q1*m2*(q2/m2): only one-group weights.
             score1 += m1 * q2 * (q1 / m1) * (k - a) * signal1
             score2 += q1 * m2 * (q2 / m2) * (v - b) * signal2
@@ -63,14 +65,17 @@ def conditional_scores(phi, psi, beta, analytic):
 class ConditionalProposalMathTest(unittest.TestCase):
     def test_sampled_and_analytic_kl_match_finite_difference(self):
         phi, psi, beta, step = .2, -.1, .7, 1e-5
-        numeric = (
-            (expectation(phi + step, psi, beta) - expectation(phi - step, psi, beta)) / (2 * step),
-            (expectation(phi, psi + step, beta) - expectation(phi, psi - step, beta)) / (2 * step),
-        )
-        for analytic in (False, True):
-            estimate = conditional_scores(phi, psi, beta, analytic)
-            for actual, expected in zip(estimate, numeric):
-                self.assertAlmostEqual(actual, expected, delta=2e-4)
+        for coefficients in ((1., 1.), (1.7, .6)):
+            numeric = (
+                (expectation(phi + step, psi, beta, coefficients) -
+                 expectation(phi - step, psi, beta, coefficients)) / (2 * step),
+                (expectation(phi, psi + step, beta, coefficients) -
+                 expectation(phi, psi - step, beta, coefficients)) / (2 * step),
+            )
+            for analytic in (False, True):
+                estimate = conditional_scores(phi, psi, beta, analytic, coefficients)
+                for actual, expected in zip(estimate, numeric):
+                    self.assertAlmostEqual(actual, expected, delta=2e-4)
 
 
 if __name__ == '__main__':
