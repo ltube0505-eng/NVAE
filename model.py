@@ -139,6 +139,7 @@ class AutoEncoder(nn.Module):
             raise ValueError('score_baseline_decay must be in [0, 1).')
         self.reinforce_num_samples = int(getattr(args, 'reinforce_num_samples', 1))
         self.obbvi_num_samples = int(getattr(args, 'obbvi_num_samples', 8))
+        self.obbvi_baseline_samples = int(getattr(args, 'obbvi_baseline_samples', 4))
         self.obbvi_objective = getattr(args, 'obbvi_objective', 'analytic_kl')
         if self.obbvi_objective not in {'sampled', 'analytic_kl'}:
             raise ValueError('Unknown O-BBVI objective: %s' % self.obbvi_objective)
@@ -148,9 +149,14 @@ class AutoEncoder(nn.Module):
         self._previous_kl_for_balance = None
         if self.reinforce_num_samples < 1 or self.obbvi_num_samples < 1:
             raise ValueError('Gradient-estimator sample counts must be positive.')
+        if self.obbvi_baseline_samples < 1:
+            raise ValueError('--obbvi_baseline_samples must be positive.')
         if self.poisson_gradient_estimator == 'obbvi' and \
                 self.obbvi_num_samples % len(self.obbvi_taus) != 0:
             raise ValueError('--obbvi_num_samples must be divisible by the number of --obbvi_taus.')
+        if self.poisson_gradient_estimator == 'obbvi' and \
+                self.obbvi_baseline_samples % len(self.obbvi_taus) != 0:
+            raise ValueError('--obbvi_baseline_samples must be divisible by the number of --obbvi_taus.')
         self._score_baseline_value = None
         self._obbvi_component = 0
         self._gradient_context = None
@@ -518,6 +524,34 @@ class AutoEncoder(nn.Module):
         score = weight * (signal - baseline.detach()) * log_q
         return score, signal, weight
 
+    def conditional_poisson_score_norm(self, group_index):
+        """Squared score with respect to the selected Poisson group's log rates."""
+        context = self._gradient_context
+        if context is None or context['proposal_group'] != group_index:
+            raise RuntimeError('A matching conditional proposal forward pass is required.')
+        z = context['samples'][group_index].detach().float()
+        rate = context['proposal_rate'].detach().float()
+        return torch.sum((z - rate) ** 2, dim=[1, 2, 3])
+
+    @staticmethod
+    def conditional_poisson_baseline(signals, weights, score_norms):
+        """Per-example conditional DMIS control variate from independent pilots.
+
+        The caller must supply pilot trajectories independent of the samples
+        used for the gradient, with equal allocation across proposal components.
+        This is an empirical mixture-moment variance proxy for the log-rate
+        score coordinates. Fixed component allocation can have a different
+        exact minimum-variance baseline.
+        """
+        signal = torch.stack(signals).detach().float()
+        weight = torch.stack(weights).detach().float()
+        score_norm = torch.stack(score_norms).detach().float()
+        importance = weight.square() * score_norm
+        numerator = torch.sum(importance * signal, dim=0)
+        denominator = torch.sum(importance, dim=0)
+        return torch.where(denominator > 0., numerator / denominator.clamp_min(1e-12),
+                           torch.zeros_like(numerator))
+
     def forward(self, x, prefix_samples=None, proposal_group=None):
         if proposal_group is not None:
             if not self.training or self.poisson_gradient_estimator != 'obbvi':
@@ -671,6 +705,7 @@ class AutoEncoder(nn.Module):
                 all_proposal_log_probs[0].float(), dim=[2, 3, 4])
             self._gradient_context['proposal_log_m'] = torch.logsumexp(
                 component_log_probs, dim=0) - np.log(float(len(self.obbvi_taus)))
+            self._gradient_context['proposal_rate'] = all_q[proposal_group].rate.detach()
 
         return logits, log_q, log_p, kl_all, kl_diag
 
