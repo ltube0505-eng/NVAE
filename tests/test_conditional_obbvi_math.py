@@ -63,6 +63,31 @@ def conditional_scores(phi, psi, beta, analytic, coefficients):
 
 
 class ConditionalProposalMathTest(unittest.TestCase):
+    def test_poisson_conditional_dmis_baseline_preserves_mean_and_reduces_variance(self):
+        rate = 2.
+        proposal_rate = rate ** (1. / 3.)
+        terms = []
+        for k in range(35):
+            q = poisson(k, rate)
+            m = (q + poisson(k, proposal_rate)) / 2.
+            weight = q / m
+            score = k - rate
+            signal = (k - 2.) ** 2 + 1.
+            terms.append((m, weight, score, signal))
+        numerator = sum(m * w ** 2 * h ** 2 * f for m, w, h, f in terms)
+        denominator = sum(m * w ** 2 * h ** 2 for m, w, h, f in terms)
+        baseline = numerator / denominator
+
+        def moments(b):
+            mean = sum(m * w * h * (f - b) for m, w, h, f in terms)
+            second = sum(m * (w * h * (f - b)) ** 2 for m, w, h, f in terms)
+            return mean, second - mean ** 2
+
+        mean_zero, var_zero = moments(0.)
+        mean_opt, var_opt = moments(baseline)
+        self.assertAlmostEqual(mean_zero, mean_opt, delta=1e-10)
+        self.assertLess(var_opt, var_zero)
+
     def test_sampled_and_analytic_kl_match_finite_difference(self):
         phi, psi, beta, step = .2, -.1, .7, 1e-5
         for coefficients in ((1., 1.), (1.7, .6)):
