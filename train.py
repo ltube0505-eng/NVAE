@@ -427,7 +427,7 @@ if __name__ == '__main__':
                         help='The constant value used for min KL coeff')
     # Flow params
     parser.add_argument('--num_nf', type=int, default=0,
-                        help='The number of normalizing flow cells per groups. Set this to zero to disable flows.')
+                        help='flow blocks per group: Gaussian AR or Poisson ST discrete swaps; 0 disables flows')
     parser.add_argument('--num_x_bits', type=int, default=8,
                         help='The number of bits used for representing data for colored images.')
     # latent variables
@@ -449,6 +449,8 @@ if __name__ == '__main__':
                         help='number of exponential arrivals used by relaxed Poisson sampling')
     parser.add_argument('--poisson_max_rate', type=float, default=30.,
                         help='upper bound on Poisson rates to control count truncation')
+    parser.add_argument('--poisson_flow_temperature', type=float, default=1.,
+                        help='sigmoid backward temperature for Poisson discrete flow gates; not sampling temperature')
     parser.add_argument('--reinforce_num_samples', type=int, default=1,
                         help='exact posterior samples per minibatch for REINFORCE')
     parser.add_argument('--score_baseline_decay', type=float, default=0.9,
