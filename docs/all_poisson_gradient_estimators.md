@@ -1,6 +1,6 @@
 # 全 Poisson NVAE 与四种梯度估计接口
 
-本分支新增 `--latent_distribution poisson`：NVAE 的每一个 latent group（包括顶层无条件后验、所有条件后验和对应条件先验）都使用 Poisson 分布。网络骨架、group 顺序、decoder combiner、观测似然、KL warm-up 和正则项保持不变；Poisson 模式要求 `--num_nf 0`。
+本分支新增 `--latent_distribution poisson`：NVAE 的每一个 latent group（包括顶层无条件后验、所有条件后验和对应条件先验）都使用 Poisson 分布。网络骨架、group 顺序、decoder combiner、观测似然、KL warm-up 和正则项保持不变。`--num_nf 0` 保留纯 Poisson 后验；`straight_through` 还支持 `--num_nf 1`（或更大）构造 **Poisson 基础后验 + 非负整数离散 flow**，先验仍是 Poisson，变换后的后验通常不再是 Poisson。数学设计、可逆性证明、采样 KL 与限制见 [离散 flow 设计](poisson_discrete_flow.md)。
 
 ## 1. 统一命令行接口
 
@@ -144,7 +144,7 @@ python train.py ... --latent_distribution poisson --num_nf 0 \
   --poisson_relaxation_temperature 0.2 --poisson_max_count 64
 ```
 
-验证与生成始终使用目标后验/先验的精确 `torch.poisson` 整数采样，不使用松弛值或 O-BBVI proposal。
+`num_nf=0` 的验证与生成使用后验/先验的精确 `torch.poisson` 整数采样。开启离散 flow 后，验证先从基础 Poisson 精确采样，再经过确定性的整数 flow；生成仅从 Poisson 先验采样，不运行后验 flow。训练 flow 路径对指数到达时间预算外的尾部补采样，因此前向基础计数没有 `max_count` 截断；反向仍使用有限到达时间的有偏 ST 代理。
 
 ## 6. 正确性测试
 
@@ -163,4 +163,3 @@ pytest -q
 6. 全模型 REINFORCE surrogate 可反向传播；
 7. 全模型 O-BBVI 产生有限且有界的 DMIS 权重；
 8. 生成路径仍使用精确 Poisson 先验采样。
-

@@ -18,6 +18,7 @@ from torch.distributions.bernoulli import Bernoulli
 
 from utils import get_stride_for_cell_type, get_input_size, groups_per_scale
 from distributions import Normal, Poisson, Gamma, DiscMixLogistic, NormalDecoder
+from discrete_flows import PairedPoissonSwapAR
 from thirdparty.inplaced_sync_batchnorm import SyncBatchNormSwish
 
 CHANNEL_MULT = 2
@@ -198,8 +199,15 @@ class AutoEncoder(nn.Module):
 
         self.with_nf = args.num_nf > 0
         self.num_flows = args.num_nf
-        if self.latent_distribution != 'normal' and self.with_nf:
-            raise ValueError('Normalizing flows are only implemented for Normal latents; use --num_nf 0.')
+        if self.num_flows < 0:
+            raise ValueError('--num_nf must be nonnegative.')
+        self.poisson_flow_temperature = getattr(args, 'poisson_flow_temperature', 1.)
+        if self.with_nf and self.latent_distribution == 'poisson':
+            if self.poisson_gradient_estimator != 'straight_through':
+                raise ValueError('Poisson discrete flows currently require straight_through; '
+                                 'use --num_nf 0 for relaxed/reinforce/obbvi.')
+        elif self.latent_distribution != 'normal' and self.with_nf:
+            raise ValueError('Mixed Poisson/Gamma flows are unsupported; use --num_nf 0.')
 
         self.enc0 = self.init_encoder0(mult)
         self.enc_sampler, self.dec_sampler, self.nf_cells, self.enc_kv, self.dec_kv, self.query = \
@@ -311,7 +319,11 @@ class AutoEncoder(nn.Module):
                     arch = self.arch_instance['ar_nn']
                     num_c1 = int(self.num_channels_enc * mult)
                     num_c2 = 8 * self.num_latent_per_group  # use 8x features
-                    nf_cells.append(PairedCellAR(self.num_latent_per_group, num_c1, num_c2, arch))
+                    if self.latent_distribution == 'poisson':
+                        nf_cells.append(PairedPoissonSwapAR(
+                            self.num_latent_per_group, num_c1, self.poisson_flow_temperature))
+                    else:
+                        nf_cells.append(PairedCellAR(self.num_latent_per_group, num_c1, num_c2, arch))
                 if not (s == 0 and g == 0):  # The first group uses a fixed family-specific prior.
                     num_c = int(self.num_channels_dec * mult)
                     cell = nn.Sequential(
@@ -428,13 +440,19 @@ class AutoEncoder(nn.Module):
             proposal_tau = None
             if estimator == 'obbvi':
                 proposal_tau = self.obbvi_taus[self._obbvi_component]
-            z, _ = dist.sample(estimator=estimator, proposal_tau=proposal_tau)
+            z, _ = dist.sample(estimator=estimator, proposal_tau=proposal_tau,
+                               exact_forward=self.with_nf)
             proposal_log_probs = None
             if estimator == 'obbvi':
                 proposal_log_probs = torch.stack(
                     [dist.proposal_log_p(z, tau) for tau in self.obbvi_taus], dim=0)
             return z, proposal_log_probs
         return dist.sample()
+
+    def _latent_log_p(self, dist, z):
+        if self.with_nf and isinstance(dist, Poisson):
+            return dist.log_p(z, strict=True)
+        return dist.log_p(z)
 
     def score_baseline(self, reference):
         if self._score_baseline_value is None:
@@ -503,7 +521,7 @@ class AutoEncoder(nn.Module):
         param0 = self.enc_sampler[idx_dec](ftr)
         dist = self._latent_from_param(idx_dec, param0)   # first approximate posterior
         z, proposal_log_probs = self._sample_latent(dist, training_sample=self.training)
-        log_q_conv = dist.log_p(z)
+        log_q_conv = self._latent_log_p(dist, z)
 
         # apply normalizing flows
         nf_offset = 0
@@ -522,7 +540,7 @@ class AutoEncoder(nn.Module):
 
         # prior for z0
         dist = self._fixed_prior(0, z)
-        log_p_conv = dist.log_p(z)
+        log_p_conv = self._latent_log_p(dist, z)
         all_p = [dist]
         all_log_p = [log_p_conv]
 
@@ -543,7 +561,7 @@ class AutoEncoder(nn.Module):
                     param = self.enc_sampler[idx_dec](ftr)
                     dist = self._latent_from_param(idx_dec, param, residual_param=prior_param)
                     z, proposal_log_probs = self._sample_latent(dist, training_sample=self.training)
-                    log_q_conv = dist.log_p(z)
+                    log_q_conv = self._latent_log_p(dist, z)
                     # apply NF
                     for n in range(self.num_flows):
                         z, log_det = self.nf_cells[nf_offset + n](z, ftr)
@@ -556,7 +574,7 @@ class AutoEncoder(nn.Module):
 
                     # evaluate log_p(z)
                     dist = prior_dist
-                    log_p_conv = dist.log_p(z)
+                    log_p_conv = self._latent_log_p(dist, z)
                     all_p.append(dist)
                     all_log_p.append(log_p_conv)
 

@@ -78,7 +78,7 @@ class Poisson:
         self.relaxation_temperature = relaxation_temperature
         self.max_count = max_count
 
-    def _arrival_counts(self):
+    def _arrival_counts(self, exact_forward=False):
         """Return hard and relaxed counts built from the same arrivals."""
         # A homogeneous Poisson count is the number of exponential arrival
         # times before t=1. Truncation is controlled by max_count/max_rate.
@@ -86,11 +86,17 @@ class Poisson:
         inter_arrivals = exponential.rsample((self.max_count,))
         arrival_times = torch.cumsum(inter_arrivals, dim=0)
         hard_count = (arrival_times <= 1.).to(self.rate.dtype).sum(dim=0)
+        if exact_forward:
+            # Conditional on T_M, arrivals after T_M form an independent
+            # Poisson process. Complete the unobserved tail instead of
+            # censoring the forward count at M; the backward path stays ST.
+            remaining_rate = (self.rate * (1. - arrival_times[-1]).clamp_min(0.)).detach()
+            hard_count = hard_count + torch.poisson(remaining_rate)
         soft_count = torch.sigmoid(
             (1. - arrival_times) / self.relaxation_temperature).sum(dim=0)
         return hard_count, soft_count
 
-    def sample(self, relaxed=False, estimator=None, proposal_tau=None):
+    def sample(self, relaxed=False, estimator=None, proposal_tau=None, exact_forward=False):
         """Sample with a named gradient estimator.
 
         ``relaxed`` is retained for backward compatibility. New code should use
@@ -109,7 +115,7 @@ class Poisson:
                 raise ValueError('proposal_tau is required for O-BBVI sampling.')
             return torch.poisson(self.proposal_rate(proposal_tau)), None
 
-        hard_count, soft_count = self._arrival_counts()
+        hard_count, soft_count = self._arrival_counts(exact_forward=exact_forward)
         if estimator == 'relaxed':
             return soft_count, None
         if estimator == 'straight_through':
@@ -119,7 +125,14 @@ class Poisson:
             return count, None
         raise ValueError('Unknown Poisson estimator: %s' % estimator)
 
-    def log_p(self, samples):
+    def log_p(self, samples, strict=False):
+        # The default continuous extension is retained for the old relaxed
+        # objective. Flow paths use strict=True: invalid support has mass zero.
+        if strict:
+            valid = torch.isfinite(samples) & (samples >= 0.) & (samples == torch.floor(samples))
+            safe_samples = torch.where(valid, samples, torch.zeros_like(samples))
+            value = safe_samples * self.log_rate - self.rate - torch.lgamma(safe_samples + 1.)
+            return torch.where(valid, value, torch.full_like(value, -float('inf')))
         samples = torch.clamp(samples, min=0.)
         return samples * self.log_rate - self.rate - torch.lgamma(samples + 1.)
 

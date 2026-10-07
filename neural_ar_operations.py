@@ -84,7 +84,9 @@ class ARConv2d(nn.Conv2d):
         self.masked = masked
         if self.masked:
             assert kernel_size % 2 == 1, 'kernel size should be an odd value.'
-            self.mask = torch.from_numpy(create_conv_mask(kernel_size, C_in, groups, C_out, zero_diag, mirror)).cuda()
+            # Follow module.to(device); keep old checkpoints unchanged.
+            self.register_buffer('mask', torch.from_numpy(create_conv_mask(
+                kernel_size, C_in, groups, C_out, zero_diag, mirror)), persistent=False)
             init_mask = self.mask.cpu()
         else:
             self.mask = 1.0
