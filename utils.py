@@ -11,6 +11,7 @@ import shutil
 import time
 from datetime import timedelta
 import sys
+import inspect
 
 import torch
 import torch.nn as nn
@@ -77,6 +78,18 @@ def save(model, model_path):
 
 def load(model, model_path):
     model.load_state_dict(torch.load(model_path))
+
+
+def load_checkpoint(path, map_location='cpu'):
+    """Load a trusted NVAE checkpoint, including its saved argparse Namespace.
+
+    PyTorch >= 2.6 defaults to weights_only=True, which rejects this metadata.
+    Keep the call compatible with the original PyTorch 1.6 environment.
+    """
+    kwargs = {'map_location': map_location}
+    if 'weights_only' in inspect.signature(torch.load).parameters:
+        kwargs['weights_only'] = False
+    return torch.load(path, **kwargs)
 
 
 def create_exp_dir(path, scripts_to_save=None):

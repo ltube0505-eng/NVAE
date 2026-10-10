@@ -41,7 +41,7 @@ def main(eval_args):
     # load a checkpoint
     logging.info('loading the model at:')
     logging.info(eval_args.checkpoint)
-    checkpoint = torch.load(eval_args.checkpoint, map_location='cpu')
+    checkpoint = utils.load_checkpoint(eval_args.checkpoint)
     args = checkpoint['args']
 
     if not hasattr(args, 'ada_groups'):
@@ -62,10 +62,9 @@ def main(eval_args):
     logging.info('loaded the model at epoch %d', checkpoint['epoch'])
     arch_instance = utils.get_arch_cells(args.arch_instance)
     model = AutoEncoder(args, None, arch_instance)
-    # Loading is not strict because of self.weight_normalized in Conv2D class in neural_operations. This variable
-    # is only used for computing the spectral normalization and it is safe not to load it. Some of our earlier models
-    # did not have this variable.
-    model.load_state_dict(checkpoint['state_dict'], strict=False)
+    # Legacy checkpoints may omit historical Conv2D normalization state. New
+    # AR/NAR checkpoints load strictly so no learned head/prior can be skipped.
+    model.load_state_dict(checkpoint['state_dict'], strict=model.ar_poisson)
     model = model.cuda()
 
     logging.info('args = %s', args)
