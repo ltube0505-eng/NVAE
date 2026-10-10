@@ -122,6 +122,7 @@ class AutoEncoder(nn.Module):
         self.ar_poisson_mc_samples = getattr(args, 'ar_poisson_mc_samples', 1)
         self.ar_transformer_args = dict(
             embed_dim=getattr(args, 'ar_embed_dim', 128),
+            memory_tokens=getattr(args, 'ar_memory_tokens', 64),
             num_heads=getattr(args, 'ar_num_heads', 4),
             num_layers=getattr(args, 'ar_num_layers', 2),
             mlp_ratio=getattr(args, 'ar_mlp_ratio', 4))
@@ -244,6 +245,11 @@ class AutoEncoder(nn.Module):
             raise ValueError('Mixed Poisson/Gamma flows are unsupported; use --num_nf 0.')
 
         self.enc0 = self.init_encoder0(mult)
+        if self.ar_poisson:
+            num_ce = int(self.num_channels_enc * mult)
+            num_cd = int(self.num_channels_dec * mult)
+            self.top_enc_combiner = EncCombinerCell(num_ce, num_cd, num_ce,
+                                                    cell_type='combiner_enc')
         self.enc_sampler, self.dec_sampler, self.nf_cells, self.enc_kv, self.dec_kv, self.query = \
             self.init_latent_sampler(mult)
 
@@ -684,11 +690,12 @@ class AutoEncoder(nn.Module):
 
     def _forward_ar_poisson(self, top_feature, combiner_cells_enc, combiner_cells_s):
         batch_size = top_feature.shape[0]
+        s = self.prior_ftr0.unsqueeze(0).expand(batch_size, -1, -1, -1)
+        top_feature = self.top_enc_combiner(top_feature, s)
         # The learned top prior does not read the encoder or the image.
         out = self._recognize_ar_poisson(0, top_feature, self.top_prior(batch_size))
         groups = [out]
         z = out['z_st']
-        s = self.prior_ftr0.unsqueeze(0).expand(batch_size, -1, -1, -1)
         group_index = 0
         for cell in self.dec_tower:
             if cell.cell_type == 'combiner_dec':

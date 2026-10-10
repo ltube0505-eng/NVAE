@@ -493,9 +493,11 @@ if __name__ == '__main__':
     parser.add_argument('--ar_gumbel_temperature', type=float, default=1.,
                         help='AR Gumbel-ST backward temperature; does not temper the categorical sampling law')
     parser.add_argument('--ar_embed_dim', type=int, default=128)
+    parser.add_argument('--ar_memory_tokens', type=int, default=64,
+                        help='fixed CNN cross-attention memory length shared by all AR groups')
     parser.add_argument('--ar_num_heads', type=int, default=4)
     parser.add_argument('--ar_num_layers', type=int, default=2,
-                        help='number of feature encoder blocks and latent decoder blocks in each AR group')
+                        help='number of latent Transformer decoder blocks in each AR group')
     parser.add_argument('--ar_mlp_ratio', type=int, default=4)
     parser.add_argument('--reinforce_num_samples', type=int, default=1,
                         help='exact posterior samples per minibatch for REINFORCE')

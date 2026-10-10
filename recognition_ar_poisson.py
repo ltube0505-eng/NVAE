@@ -151,7 +151,7 @@ class RecognitionScale1(nn.Module):
 
     @staticmethod
     def _init(module):
-        if isinstance(module, nn.Linear):
+        if isinstance(module, (nn.Linear, nn.Conv2d)):
             nn.init.xavier_uniform_(module.weight)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
@@ -184,7 +184,7 @@ class RecognitionScale1(nn.Module):
     def sample(self, x, tau=1.0):
         return self.sample_memory(self.encode_image(x), tau)
 
-    def sample_memory(self, memory, tau=1.0):
+    def sample_memory(self, memory, tau=1.0, return_cache=True):
         if tau is not None and tau <= 0:
             raise ValueError("tau must be positive or None")
         b = memory.shape[0]
@@ -225,10 +225,18 @@ class RecognitionScale1(nn.Module):
         log_q_i = (y_st * log_probs).sum(-1)
         # 记录：同一个硬样本的 log q；仅用于指标/一致性检查。
         log_q_i_hard = log_probs.gather(-1, z[..., None]).squeeze(-1)
-        return dict(z=z, y_st=y_st, logits=logits, probs=log_probs.exp(),
-                    log_probs=log_probs, log_q_i=log_q_i,
-                    log_q=log_q_i.sum(-1), log_q_i_hard=log_q_i_hard,
-                    self_kv=self_kv, cross_kv=cross_kv)
+        result = dict(z=z, y_st=y_st, logits=logits, probs=log_probs.exp(),
+                      log_probs=log_probs, log_q_i=log_q_i,
+                      log_q=log_q_i.sum(-1), log_q_i_hard=log_q_i_hard)
+        if return_cache:
+            # Standalone scoring/debugging can inspect the complete cache.
+            result.update(self_kv=self_kv, cross_kv=cross_kv)
+        else:
+            # NVAE group boundary: release explicit cache references, without
+            # detaching tensors needed by backward through earlier ST samples.
+            self_kv.clear()
+            cross_kv.clear()
+        return result
 
     def forward(self, x, tau=1.0):
         return self.sample(x, tau)
@@ -341,24 +349,41 @@ class LearnablePoissonPrior(nn.Module):
 
 
 class ARFeatureRecognition(RecognitionScale1):
-    """在 NVAE posterior feature map 上使用附录 I 的 encoder/decoder 结构。"""
-    def __init__(self, feature_shape, d_lat, **kwargs):
+    """CNN memory of fixed length; only this group's latent prefix is cached."""
+    def __init__(self, feature_shape, d_lat, memory_tokens=64, **kwargs):
+        if not isinstance(memory_tokens, int) or memory_tokens < 1:
+            raise ValueError("memory_tokens must be a positive integer")
         c, h, w = feature_shape
         super().__init__(image_shape=feature_shape, patch_grid=(h, w),
                          d_lat=d_lat, **kwargs)
-        # NVAE 已提供卷积特征；把每个空间位置当一个 patch，而非再次补零。
+        # Reuse the latent decoder, but replace the patch/Transformer feature
+        # encoder with a CNN over the fused NVAE encoder/decoder feature map.
         del self.patch_proj
-        self.feature_proj = nn.Linear(c, self.embedding.embedding_dim)
-        self._init(self.feature_proj)
+        del self.encoder
+        width = self.embedding.embedding_dim
+        grid_h = math.isqrt(memory_tokens)
+        while memory_tokens % grid_h:
+            grid_h -= 1
+        self.memory_tokens = memory_tokens
+        self.memory_grid = (grid_h, memory_tokens // grid_h)
+        self.feature_cnn = nn.Sequential(
+            nn.Conv2d(c, width, kernel_size=3, padding=1), nn.ELU(),
+            nn.Conv2d(width, width, kernel_size=3, padding=1), nn.ELU(),
+            nn.AdaptiveAvgPool2d(self.memory_grid))
+        self.feature_cnn.apply(self._init)
+        self.image_pos = sinusoidal_positions(memory_tokens, width)
 
     def encode_image(self, feature):
         if tuple(feature.shape[1:]) != self.image_shape:
             raise ValueError("unexpected NVAE posterior feature shape")
-        tokens = feature.flatten(2).transpose(1, 2)
-        h = self.input_drop(self.feature_proj(tokens) + self.image_pos)
-        for block in self.encoder:
-            h = block(h)
-        return self.enc_norm(h)
+        tokens = self.feature_cnn(feature).flatten(2).transpose(1, 2)
+        return self.enc_norm(self.input_drop(tokens + self.image_pos))
+
+    def sample(self, feature, tau=1.0):
+        # Cross K/V is projected once from fixed CNN memory in sample_memory.
+        # Self K/V starts empty and includes only BOS/shifted group latents.
+        return self.sample_memory(self.encode_image(feature), tau,
+                                  return_cache=False)
 
 
 def ar_group_result(out, rate_p, latent_shape):
