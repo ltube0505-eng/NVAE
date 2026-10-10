@@ -49,13 +49,19 @@ def main(args):
     logging.info('param size = %fM ', utils.count_parameters_in_M(model))
     logging.info('groups per scale: %s, total_groups: %d', model.groups_per_scale, sum(model.groups_per_scale))
 
+    standard_ar_poisson = model.ar_poisson and model.ar_poisson_objective == 'standard'
+    optimizer_weight_decay = 0. if standard_ar_poisson else args.weight_decay
+    if standard_ar_poisson:
+        logging.info('AR/NAR standard NELBO: beta=1, no KL balancing, norm/BN regularization '
+                     'or optimizer weight decay; CTS mode=%s, MC trajectories=%d',
+                     model.ar_poisson_cts_mode, model.ar_poisson_mc_samples)
     if args.fast_adamax:
         # Fast adamax has the same functionality as torch.optim.Adamax, except it is faster.
         cnn_optimizer = Adamax(model.parameters(), args.learning_rate,
-                               weight_decay=args.weight_decay, eps=1e-3)
+                               weight_decay=optimizer_weight_decay, eps=1e-3)
     else:
         cnn_optimizer = torch.optim.Adamax(model.parameters(), args.learning_rate,
-                                           weight_decay=args.weight_decay, eps=1e-3)
+                                           weight_decay=optimizer_weight_decay, eps=1e-3)
 
     cnn_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         cnn_optimizer, float(args.epochs - args.warmup_epochs - 1), eta_min=args.learning_rate_min)
@@ -68,11 +74,14 @@ def main(args):
     checkpoint_file = os.path.join(args.save, 'checkpoint.pt')
     if args.cont_training:
         logging.info('loading the model.')
-        checkpoint = torch.load(checkpoint_file, map_location='cpu')
+        checkpoint = utils.load_checkpoint(checkpoint_file)
         init_epoch = checkpoint['epoch']
         model.load_state_dict(checkpoint['state_dict'])
         model = model.cuda()
         cnn_optimizer.load_state_dict(checkpoint['optimizer'])
+        if standard_ar_poisson:
+            for param_group in cnn_optimizer.param_groups:
+                param_group['weight_decay'] = 0.
         grad_scalar.load_state_dict(checkpoint['grad_scalar'])
         cnn_scheduler.load_state_dict(checkpoint['scheduler'])
         global_step = checkpoint['global_step']
@@ -145,6 +154,7 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
                                       groups_per_scale=model.groups_per_scale, fun='square')
     nelbo = utils.AvgrageMeter()
     model.train()
+    standard_ar_poisson = model.ar_poisson and model.ar_poisson_objective == 'standard'
     for step, x in enumerate(train_queue):
         x = x[0] if len(x) > 1 else x
         x = x.cuda()
@@ -166,6 +176,8 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
         with autocast():
             kl_coeff = utils.kl_coeff(global_step, args.kl_anneal_portion * args.num_total_iter,
                                       args.kl_const_portion * args.num_total_iter, args.kl_const_coeff)
+            if standard_ar_poisson:
+                kl_coeff = 1.
             score_estimator = model.poisson_gradient_estimator in {'reinforce', 'obbvi'}
             importance_ess = None
 
@@ -214,19 +226,35 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
                            for group in range(len(kl_diag_samples[0]))]
                 _, kl_coeffs, kl_vals = utils.kl_balancer(kl_all, kl_coeff, kl_balance=False)
             else:
-                logits, log_q, log_p, kl_all, kl_diag = model(x)
-                output = model.decoder_output(logits)
-                recon_loss = utils.reconstruction_loss(output, x, crop=model.crop_output)
+                num_mc = model.ar_poisson_mc_samples if model.ar_poisson else 1
+                recon_samples, kl_samples, kl_diag_samples = [], [], []
+                for _ in range(num_mc):
+                    # Each forward rebuilds top-down state and all KV caches.
+                    logits, log_q, log_p, kl_all_i, kl_diag_i = model(x)
+                    output = model.decoder_output(logits)
+                    recon_samples.append(utils.reconstruction_loss(output, x, crop=model.crop_output))
+                    kl_samples.append(kl_all_i)
+                    kl_diag_samples.append(kl_diag_i)
+                recon_loss = torch.stack(recon_samples).mean(0)
+                kl_all = [torch.stack([sample[g] for sample in kl_samples]).mean(0)
+                          for g in range(len(kl_samples[0]))]
+                kl_diag = [torch.stack([sample[g] for sample in kl_diag_samples]).mean(0)
+                           for g in range(len(kl_diag_samples[0]))]
                 balanced_kl, kl_coeffs, kl_vals = utils.kl_balancer(
-                    kl_all, kl_coeff, kl_balance=True, alpha_i=alpha_i)
+                    kl_all, kl_coeff, kl_balance=not standard_ar_poisson, alpha_i=alpha_i)
                 nelbo_batch = recon_loss + balanced_kl
                 loss = torch.mean(nelbo_batch)
 
-            reported_nelbo = torch.mean(nelbo_batch.detach())
-            norm_loss = model.spectral_norm_parallel()
-            bn_loss = model.batchnorm_loss()
+            if model.ar_poisson:
+                reported_nelbo = (recon_loss + sum(kl_all)).detach().mean()
+            else:
+                reported_nelbo = torch.mean(nelbo_batch.detach())
+            norm_loss = loss.new_zeros(()) if standard_ar_poisson else model.spectral_norm_parallel()
+            bn_loss = loss.new_zeros(()) if standard_ar_poisson else model.batchnorm_loss()
             # get spectral regularization coefficient (lambda)
-            if args.weight_decay_norm_anneal:
+            if standard_ar_poisson:
+                wdn_coeff = 0.
+            elif args.weight_decay_norm_anneal:
                 assert args.weight_decay_norm_init > 0 and args.weight_decay_norm > 0, 'init and final wdn should be positive.'
                 wdn_coeff = (1. - kl_coeff) * np.log(args.weight_decay_norm_init) + kl_coeff * np.log(args.weight_decay_norm)
                 wdn_coeff = np.exp(wdn_coeff)
@@ -234,6 +262,7 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
                 wdn_coeff = args.weight_decay_norm
 
             loss += norm_loss * wdn_coeff + bn_loss * wdn_coeff
+            reported_objective = loss.detach()
 
         grad_scalar.scale(loss).backward()
         utils.average_gradients(model.parameters(), args.distributed)
@@ -263,6 +292,10 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
             writer.add_scalar('train/lr', cnn_optimizer.state_dict()[
                               'param_groups'][0]['lr'], global_step)
             writer.add_scalar('train/nelbo_iter', reported_nelbo, global_step)
+            if model.ar_poisson:
+                writer.add_scalar('train/objective_iter', reported_objective, global_step)
+                for g, saturation in enumerate(model._ar_poisson_saturation):
+                    writer.add_scalar('train/nar_saturation_%d' % g, saturation, global_step)
             writer.add_scalar('train/kl_iter', torch.mean(sum(kl_all)), global_step)
             writer.add_scalar('train/recon_iter', torch.mean(recon_loss), global_step)
             writer.add_scalar('kl_coeff/coeff', kl_coeff, global_step)
@@ -438,7 +471,7 @@ if __name__ == '__main__':
     parser.add_argument('--num_latent_per_group', type=int, default=20,
                         help='number of channels in latent variables per group')
     parser.add_argument('--latent_distribution', type=str, default='normal',
-                        choices=['normal', 'poisson', 'mixed_poisson_gamma'],
+                        choices=['normal', 'poisson', 'mixed_poisson_gamma', 'ar_poisson'],
                         help='latent family; poisson makes every latent group Poisson')
     parser.add_argument('--poisson_gradient_estimator', type=str, default='straight_through',
                         choices=['relaxed', 'reinforce', 'obbvi', 'straight_through'],
@@ -451,6 +484,19 @@ if __name__ == '__main__':
                         help='upper bound on Poisson rates to control count truncation')
     parser.add_argument('--poisson_flow_temperature', type=float, default=1.,
                         help='sigmoid backward temperature for Poisson discrete flow gates; not sampling temperature')
+    parser.add_argument('--ar_poisson_cts_mode', choices=['capped64', 'exact64'], default='capped64',
+                        help='NAR posterior: capped counts with finite-sum KL, or full Poisson with analytic KL')
+    parser.add_argument('--ar_poisson_objective', choices=['standard', 'nvae'], default='standard',
+                        help='standard NELBO (beta=1, no extra penalties) or explicit NVAE annealing/regularization')
+    parser.add_argument('--ar_poisson_mc_samples', type=int, default=1,
+                        help='independent full hierarchical trajectories per AR/NAR training minibatch')
+    parser.add_argument('--ar_gumbel_temperature', type=float, default=1.,
+                        help='AR Gumbel-ST backward temperature; does not temper the categorical sampling law')
+    parser.add_argument('--ar_embed_dim', type=int, default=128)
+    parser.add_argument('--ar_num_heads', type=int, default=4)
+    parser.add_argument('--ar_num_layers', type=int, default=2,
+                        help='number of feature encoder blocks and latent decoder blocks in each AR group')
+    parser.add_argument('--ar_mlp_ratio', type=int, default=4)
     parser.add_argument('--reinforce_num_samples', type=int, default=1,
                         help='exact posterior samples per minibatch for REINFORCE')
     parser.add_argument('--score_baseline_decay', type=float, default=0.9,

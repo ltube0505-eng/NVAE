@@ -19,6 +19,8 @@ from torch.distributions.bernoulli import Bernoulli
 from utils import get_stride_for_cell_type, get_input_size, groups_per_scale
 from distributions import Normal, Poisson, Gamma, DiscMixLogistic, NormalDecoder
 from discrete_flows import PairedPoissonSwapAR
+from recognition_ar_poisson import (ARPoissonGroup, IndependentPoissonGroup,
+                                    LearnablePoissonPrior, positive_rate)
 from thirdparty.inplaced_sync_batchnorm import SyncBatchNormSwish
 
 CHANNEL_MULT = 2
@@ -113,11 +115,41 @@ class AutoEncoder(nn.Module):
         self.res_dist = args.res_dist
         self.num_bits = args.num_x_bits
         self.latent_distribution = getattr(args, 'latent_distribution', 'normal')
+        self.ar_poisson = self.latent_distribution == 'ar_poisson'
+        self.ar_gumbel_temperature = getattr(args, 'ar_gumbel_temperature', 1.)
+        self.ar_poisson_cts_mode = getattr(args, 'ar_poisson_cts_mode', 'capped64')
+        self.ar_poisson_objective = getattr(args, 'ar_poisson_objective', 'standard')
+        self.ar_poisson_mc_samples = getattr(args, 'ar_poisson_mc_samples', 1)
+        self.ar_transformer_args = dict(
+            embed_dim=getattr(args, 'ar_embed_dim', 128),
+            num_heads=getattr(args, 'ar_num_heads', 4),
+            num_layers=getattr(args, 'ar_num_layers', 2),
+            mlp_ratio=getattr(args, 'ar_mlp_ratio', 4))
+        if self.ar_poisson:
+            if int(torch.__version__.split('.')[0]) < 2 or not hasattr(torch, 'special'):
+                raise ValueError('ar_poisson requires PyTorch >= 2.0; torch 1.6 is unsupported.')
+            if self.ar_poisson_cts_mode not in {'capped64', 'exact64'}:
+                raise ValueError('ar_poisson_cts_mode must be capped64 or exact64.')
+            if self.ar_poisson_objective not in {'standard', 'nvae'}:
+                raise ValueError('ar_poisson_objective must be standard or nvae.')
+            if self.ar_poisson_mc_samples < 1:
+                raise ValueError('ar_poisson_mc_samples must be positive.')
         self.poisson_relaxation_temperature = getattr(args, 'poisson_relaxation_temperature', 0.1)
         self.poisson_max_count = getattr(args, 'poisson_max_count', 64)
         self.poisson_max_rate = getattr(args, 'poisson_max_rate', 30.)
         self.poisson_gradient_estimator = getattr(
             args, 'poisson_gradient_estimator', 'straight_through')
+        if self.ar_poisson:
+            if args.num_nf != 0:
+                raise ValueError('ar_poisson requires --num_nf 0.')
+            if self.poisson_gradient_estimator != 'straight_through':
+                raise ValueError('ar_poisson requires --poisson_gradient_estimator straight_through.')
+            if self.poisson_max_count != 64:
+                raise ValueError('ar_poisson fixes --poisson_max_count 64.')
+            if self.ar_gumbel_temperature <= 0 or self.poisson_relaxation_temperature <= 0:
+                raise ValueError('AR Gumbel and NAR CTS temperatures must be positive.')
+            if any(value < 1 for value in self.ar_transformer_args.values()):
+                raise ValueError('Transformer dimensions and layer counts must be positive.')
         valid_estimators = {'relaxed', 'reinforce', 'obbvi', 'straight_through'}
         if self.poisson_gradient_estimator not in valid_estimators:
             raise ValueError('Unknown Poisson gradient estimator: %s' %
@@ -188,6 +220,8 @@ class AutoEncoder(nn.Module):
                            self.input_size // spatial_scaling)
         self.prior_ftr0 = nn.Parameter(torch.rand(size=prior_ftr0_size), requires_grad=True)
         self.z0_size = [self.num_latent_per_group, self.input_size // spatial_scaling, self.input_size // spatial_scaling]
+        if self.ar_poisson:
+            self.top_prior = LearnablePoissonPrior(self.z0_size)
 
         self.stem = self.init_stem()
         self.pre_process, mult = self.init_pre_process(mult=1)
@@ -309,10 +343,24 @@ class AutoEncoder(nn.Module):
         enc_kv, dec_kv, query = nn.ModuleList(), nn.ModuleList(), nn.ModuleList()
         for s in range(self.num_latent_scales):
             for g in range(self.groups_per_scale[self.num_latent_scales - s - 1]):
-                # Each head emits two tensors: Normal (mu, log_sigma),
-                # Gamma (log_shape, log_rate), or Poisson (log_rate, unused).
+                # Legacy heads emit two tensors; AR/NAR uses a categorical
+                # recognizer or one rate channel per latent channel.
                 num_c = int(self.num_channels_enc * mult)
-                cell = Conv2D(num_c, 2 * self.num_latent_per_group, kernel_size=3, padding=1, bias=True)
+                if self.ar_poisson:
+                    side = self.z0_size[1] * (2 ** s)
+                    latent_shape = (self.num_latent_per_group, side, side)
+                    d_lat = self.num_latent_per_group * side * side
+                    if not 1 <= d_lat <= 1024:
+                        raise ValueError('ar_poisson group %d has %d scalars; require 1 <= C_z*H*W <= 1024. '
+                                         'Reduce num_latent_per_group or increase preprocessing downsampling.' %
+                                         (len(enc_sampler), d_lat))
+                    if self._latent_kind(len(enc_sampler)) == 'ar':
+                        cell = ARPoissonGroup((num_c, side, side), latent_shape,
+                                              **self.ar_transformer_args)
+                    else:
+                        cell = IndependentPoissonGroup(num_c, latent_shape, self.res_dist)
+                else:
+                    cell = Conv2D(num_c, 2 * self.num_latent_per_group, kernel_size=3, padding=1, bias=True)
                 enc_sampler.append(cell)
                 # build NF
                 for n in range(self.num_flows):
@@ -324,11 +372,12 @@ class AutoEncoder(nn.Module):
                             self.num_latent_per_group, num_c1, self.poisson_flow_temperature))
                     else:
                         nf_cells.append(PairedCellAR(self.num_latent_per_group, num_c1, num_c2, arch))
-                if not (s == 0 and g == 0):  # The first group uses a fixed family-specific prior.
+                if not (s == 0 and g == 0):  # AR/NAR learns the top prior separately.
                     num_c = int(self.num_channels_dec * mult)
                     cell = nn.Sequential(
                         nn.ELU(),
-                        Conv2D(num_c, 2 * self.num_latent_per_group, kernel_size=1, padding=0, bias=True))
+                        Conv2D(num_c, (1 if self.ar_poisson else 2) * self.num_latent_per_group,
+                               kernel_size=1, padding=0, bias=True))
                     dec_sampler.append(cell)
 
             mult = mult / CHANNEL_MULT
@@ -393,6 +442,8 @@ class AutoEncoder(nn.Module):
                              Conv2D(C_in, C_out, 3, padding=1, bias=True))
 
     def _latent_kind(self, group_index):
+        if self.ar_poisson:
+            return 'ar' if group_index % 2 == 0 else 'nar'
         if self.latent_distribution == 'normal':
             return 'normal'
         if self.latent_distribution == 'poisson':
@@ -518,6 +569,8 @@ class AutoEncoder(nn.Module):
 
         idx_dec = 0
         ftr = self.enc0(s)                            # this reduces the channel dimension
+        if self.ar_poisson:
+            return self._forward_ar_poisson(ftr, combiner_cells_enc, combiner_cells_s)
         param0 = self.enc_sampler[idx_dec](ftr)
         dist = self._latent_from_param(idx_dec, param0)   # first approximate posterior
         z, proposal_log_probs = self._sample_latent(dist, training_sample=self.training)
@@ -621,7 +674,78 @@ class AutoEncoder(nn.Module):
 
         return logits, log_q, log_p, kl_all, kl_diag
 
+    def _recognize_ar_poisson(self, group_index, feature, prior_raw):
+        head = self.enc_sampler[group_index]
+        if self._latent_kind(group_index) == 'ar':
+            tau = self.ar_gumbel_temperature if self.training else None
+            return head(feature, prior_raw, tau=tau)
+        tau = self.poisson_relaxation_temperature if self.training else None
+        return head(feature, prior_raw, tau=tau, mode=self.ar_poisson_cts_mode)
+
+    def _forward_ar_poisson(self, top_feature, combiner_cells_enc, combiner_cells_s):
+        batch_size = top_feature.shape[0]
+        # The learned top prior does not read the encoder or the image.
+        out = self._recognize_ar_poisson(0, top_feature, self.top_prior(batch_size))
+        groups = [out]
+        z = out['z_st']
+        s = self.prior_ftr0.unsqueeze(0).expand(batch_size, -1, -1, -1)
+        group_index = 0
+        for cell in self.dec_tower:
+            if cell.cell_type == 'combiner_dec':
+                if group_index > 0:
+                    # Form prior before injecting this group; only s enters its head.
+                    prior_raw = self.dec_sampler[group_index - 1](s)
+                    feature = combiner_cells_enc[group_index - 1](
+                        combiner_cells_s[group_index - 1], s)
+                    out = self._recognize_ar_poisson(group_index, feature, prior_raw)
+                    groups.append(out)
+                    z = out['z_st']
+                s = cell(s, z)
+                group_index += 1
+            else:
+                s = cell(s)
+        if self.vanilla_vae:
+            s = self.stem_decoder(z)
+        for cell in self.post_process:
+            s = cell(s)
+        logits = self.image_conditional(s)
+        kl_all = [out['kl'] for out in groups]
+        kl_diag = [out['kl_per_var'].reshape_as(out['z_st']).sum(dim=(2, 3)).mean(0)
+                   for out in groups]
+        log_q = torch.stack([out['log_q'] for out in groups]).sum(0)
+        log_p = torch.stack([out['log_p'] for out in groups]).sum(0)
+        self._gradient_context = {'log_q': log_q, 'log_p': log_p}
+        # Keep compact detached diagnostics rather than an entire Transformer graph.
+        self._ar_poisson_saturation = [out['saturated'].float().mean().detach()
+                                       for out in groups if out['kind'] == 'nar']
+        return logits, log_q, log_p, kl_all, kl_diag
+
+    def _sample_ar_poisson(self, num_samples, t):
+        if t <= 0:
+            raise ValueError('Poisson generation temperature must be positive.')
+        # t=1 is the declared model. Other temperatures scale the prior rates.
+        raw = self.top_prior(num_samples)
+        z = torch.poisson(positive_rate(raw.float()) * t)
+        s = self.prior_ftr0.unsqueeze(0).expand(num_samples, -1, -1, -1)
+        group_index = 0
+        for cell in self.dec_tower:
+            if cell.cell_type == 'combiner_dec':
+                if group_index > 0:
+                    raw = self.dec_sampler[group_index - 1](s)
+                    z = torch.poisson(positive_rate(raw.float()) * t)
+                s = cell(s, z)
+                group_index += 1
+            else:
+                s = cell(s)
+        if self.vanilla_vae:
+            s = self.stem_decoder(z)
+        for cell in self.post_process:
+            s = cell(s)
+        return self.image_conditional(s)
+
     def sample(self, num_samples, t):
+        if self.ar_poisson:
+            return self._sample_ar_poisson(num_samples, t)
         scale_ind = 0
         z0_size = [num_samples] + self.z0_size
         reference = torch.zeros(z0_size, device=self.prior_ftr0.device)
