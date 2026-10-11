@@ -356,9 +356,8 @@ class AutoEncoder(nn.Module):
                     side = self.z0_size[1] * (2 ** s)
                     latent_shape = (self.num_latent_per_group, side, side)
                     d_lat = self.num_latent_per_group * side * side
-                    if not 1 <= d_lat <= 1024:
-                        raise ValueError('ar_poisson group %d has %d scalars; require 1 <= C_z*H*W <= 1024. '
-                                         'Reduce num_latent_per_group or increase preprocessing downsampling.' %
+                    if d_lat < 1:
+                        raise ValueError('ar_poisson group %d has %d scalars; C_z*H*W must be positive.' %
                                          (len(enc_sampler), d_lat))
                     if self._latent_kind(len(enc_sampler)) == 'ar':
                         cell = ARPoissonGroup((num_c, side, side), latent_shape,

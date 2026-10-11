@@ -11,9 +11,11 @@ Groups are numbered in top-down generation order, across all scales. Even
 groups use an autoregressive 64-class categorical posterior, odd groups use
 conditionally independent Poisson counts. The sequence starts with AR and
 does not restart at scale boundaries. Each group must have
-`1 <= C_z * H_g * W_g <= 1024`; construction rejects larger groups with the
-offending index and size. `num_latent_per_group` remains the number of latent
-**channels**, not the flattened sequence length.
+positive latent dimensions, with sequence length `d_lat = C_z * H_g * W_g`.
+There is no fixed upper bound on `d_lat`; positional encodings are generated
+for the configured length. `num_latent_per_group` remains the number of latent
+**channels**, not the flattened sequence length. AR sampling is still sequential,
+so available memory and runtime determine the practical maximum.
 
 The bottom-up encoder, feature/state combiners, top-down decoder, and
 dataset-specific image likelihood remain NVAE modules. Before each non-top

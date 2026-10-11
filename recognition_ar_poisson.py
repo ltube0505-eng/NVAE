@@ -123,8 +123,6 @@ class RecognitionScale1(nn.Module):
         super().__init__()
         c, ih, iw = image_shape
         gh, gw = patch_grid
-        if not 1 <= d_lat <= 1024:
-            raise ValueError("d_lat must be in [1, 1024]")
         if min(c, ih, iw, gh, gw, d_lat, num_layers) <= 0:
             raise ValueError("shape, d_lat and num_layers must be positive")
         if embed_dim < 4 or embed_dim % 2:
@@ -425,8 +423,8 @@ class IndependentPoissonGroup(nn.Module):
     def __init__(self, feature_channels, latent_shape, res_dist=True):
         super().__init__()
         c, h, w = latent_shape
-        if not 1 <= math.prod(latent_shape) <= 1024:
-            raise ValueError("each group must contain <= 1024 scalar latents")
+        if min(c, h, w) <= 0:
+            raise ValueError("latent shape dimensions must be positive")
         self.latent_shape, self.res_dist = tuple(latent_shape), res_dist
         self.head = nn.Sequential(nn.ELU(), nn.Conv2d(feature_channels, c, 3, padding=1))
 
