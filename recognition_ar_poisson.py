@@ -21,6 +21,12 @@ def sinusoidal_positions(length, width):
     return torch.cat([torch.sin(pos * freq), torch.cos(pos * freq)], -1)[None]
 
 
+class GrowingKV:
+    """Per-forward capacity cache; functional writes preserve ST autograd."""
+    def __init__(self, k, v, length):
+        self.k, self.v, self.length = k, v, length
+
+
 class MHA(nn.Module):
     def __init__(self, width, heads, attention_dropout=0.0):
         super().__init__()
@@ -32,6 +38,8 @@ class MHA(nn.Module):
         self.v = nn.Linear(width, width, bias=False)
         self.out = nn.Linear(width, width, bias=False)
         self.attention_dropout = attention_dropout
+        self.grow_target_every = 0
+        self.max_cache_length = None
 
     def split(self, x):
         b, t, _ = x.shape
@@ -44,8 +52,8 @@ class MHA(nn.Module):
         q = self.split(self.q(query))
         k, v = kv
         # Boolean masks use True = visible, as in the original attention.
-        # Cached steps already contain only past/current inputs. Do not use
-        # is_causal=True for the non-square (one query, full prefix) case.
+        # Step caches contain past/current inputs plus masked spare capacity.
+        # Do not use is_causal=True for one query against a full prefix.
         h = F.scaled_dot_product_attention(
             q, k, v, attn_mask=allowed,
             dropout_p=self.attention_dropout if self.training else 0.0,
@@ -58,11 +66,37 @@ class MHA(nn.Module):
 
     def step(self, x, old_kv):
         k, v = self.project_kv(x)
+        if self.grow_target_every:
+            return self._growing_step(x, old_kv, k, v)
         if old_kv is not None:
             k = torch.cat([old_kv[0], k], dim=2)
             v = torch.cat([old_kv[1], v], dim=2)
         # 每次只传入一个新位置；cache 中只有过去及当前输入，无未来位置。
         return self.attend(x, (k, v)), (k, v)
+
+    def _growing_step(self, x, old_kv, new_k, new_v):
+        length = 1 if old_kv is None else old_kv.length + 1
+        capacity = math.ceil(length / self.grow_target_every) * self.grow_target_every
+        if self.max_cache_length is not None:
+            capacity = min(capacity, self.max_cache_length)
+        if capacity < length:
+            raise ValueError("KV cache exceeded the mini-group sequence length")
+        if old_kv is None:
+            shape = (new_k.shape[0], self.heads, capacity, self.head_dim)
+            k, v = new_k.new_zeros(shape), new_v.new_zeros(shape)
+        elif capacity > old_kv.k.shape[2]:
+            padding = capacity - old_kv.k.shape[2]
+            k, v = F.pad(old_kv.k, (0, 0, 0, padding)), F.pad(old_kv.v, (0, 0, 0, padding))
+        elif torch.is_grad_enabled():
+            # Never overwrite tensors saved by earlier attention backwards.
+            k, v = old_kv.k.clone(), old_kv.v.clone()
+        else:
+            # In no-grad inference the allocation is reused inside each chunk.
+            k, v = old_kv.k, old_kv.v
+        k[:, :, length - 1:length] = new_k
+        v[:, :, length - 1:length] = new_v
+        allowed = (torch.arange(capacity, device=k.device) < length)[None, None, None]
+        return self.attend(x, (k, v), allowed), GrowingKV(k, v, length)
 
 
 class FFN(nn.Module):
@@ -120,7 +154,8 @@ class RecognitionScale1(nn.Module):
     """单尺度；q(z|x)=prod_i q(z_i|x,z_<i)，V 固定为 64。"""
     def __init__(self, image_shape=(3, 32, 32), patch_grid=(8, 8),
                  d_lat=64, embed_dim=128, num_heads=4, num_layers=2,
-                 mlp_ratio=4, dropout=0.0, attention_dropout=0.0):
+                 mlp_ratio=4, dropout=0.0, attention_dropout=0.0,
+                 mini_groups=1, grow_target_every=0):
         super().__init__()
         c, ih, iw = image_shape
         gh, gw = patch_grid
@@ -133,12 +168,30 @@ class RecognitionScale1(nn.Module):
         pw = 2 * math.ceil(math.ceil(iw / gw) / 2)
         self.image_shape = tuple(image_shape)
         self.grid, self.patch = (gh, gw), (ph, pw)
+        if not isinstance(mini_groups, int) or mini_groups < 1:
+            raise ValueError("mini_groups must be a positive integer")
+        if not isinstance(grow_target_every, int) or grow_target_every < 0:
+            raise ValueError("grow_target_every must be a nonnegative integer")
         self.d_lat, self.vocab_size = d_lat, 64
+        self.mini_groups = min(mini_groups, d_lat)
+        self.mini_length = math.ceil(d_lat / self.mini_groups)
+        self.grow_target_every = grow_target_every
+        sizes = torch.full((self.mini_groups,), d_lat // self.mini_groups, dtype=torch.long)
+        sizes[:d_lat % self.mini_groups] += 1
+        starts = sizes.cumsum(0) - sizes
+        local = torch.arange(self.mini_length)[None]
+        valid = local < sizes[:, None]
+        # Layout metadata is reconstructed from args, not stored in checkpoints.
+        self.register_buffer("mini_positions", (starts[:, None] + local).clamp_max(d_lat - 1), persistent=False)
+        self.register_buffer("mini_valid_indices", valid.flatten().nonzero().flatten(), persistent=False)
         self.patch_proj = nn.Linear(ph * pw * c, embed_dim)
         self.embedding = nn.Embedding(64, embed_dim)
         args = (embed_dim, num_heads, mlp_ratio, dropout, attention_dropout)
         self.encoder = nn.ModuleList([EncoderBlock(*args) for _ in range(num_layers)])
         self.decoder = nn.ModuleList([DecoderBlock(*args) for _ in range(num_layers)])
+        for block in self.decoder:
+            block.self_attn.grow_target_every = grow_target_every
+            block.self_attn.max_cache_length = self.mini_length
         self.enc_norm = nn.LayerNorm(embed_dim, eps=1e-6)
         self.dec_norm = nn.LayerNorm(embed_dim, eps=1e-6)
         self.head = nn.Linear(embed_dim, 64)
@@ -183,55 +236,82 @@ class RecognitionScale1(nn.Module):
     def sample(self, x, tau=1.0):
         return self.sample_memory(self.encode_image(x), tau)
 
-    def sample_memory(self, memory, tau=1.0):
+    def _mini_cross_kv(self, memory):
+        # Project once at batch B, then broadcast memory to independent streams.
+        b, g = memory.shape[0], self.mini_groups
+        def expand(tensor):
+            return tensor[:, None].expand(b, g, *tensor.shape[1:]).reshape(b * g, *tensor.shape[1:])
+        return [(expand(k), expand(v)) for k, v in self.prepare_cross_kv(memory)]
+
+    def _mini_positions(self, batch):
+        positions = self.latent_pos[0].index_select(0, self.mini_positions.flatten())
+        positions = positions.reshape(self.mini_groups, self.mini_length, -1)
+        return positions[None].expand(batch, -1, -1, -1).reshape(
+            batch * self.mini_groups, self.mini_length, -1)
+
+    def _pack_mini(self, values):
+        # Flat CHW coordinates are partitioned into balanced contiguous streams.
+        return values.index_select(1, self.mini_positions.flatten()).reshape(
+            values.shape[0] * self.mini_groups, self.mini_length, *values.shape[2:])
+
+    def _unpack_mini(self, values, batch):
+        padded = values.reshape(batch, self.mini_groups * self.mini_length, *values.shape[2:])
+        return padded.index_select(1, self.mini_valid_indices)
+
+    def sample_memory(self, memory, tau=1.0, return_cache=True):
         if tau is not None and tau <= 0:
             raise ValueError("tau must be positive or None")
         b = memory.shape[0]
-        cross_kv = self.prepare_cross_kv(memory)
+        streams = b * self.mini_groups
+        cross_kv = self._mini_cross_kv(memory)
+        positions = self._mini_positions(b)
         self_kv = [None] * len(self.decoder)
-        # 与仓库 PAD_ID=0 起始方式一致。0 仍是有效类别，不作为 padding mask。
-        prev = memory.new_zeros(b, 1, 64)
+        prev = memory.new_zeros(streams, 1, 64)
         prev[..., 0] = 1.0
         all_logits, all_y, all_z = [], [], []
-        for t in range(self.d_lat):
-            # Keep the ST embedding path in FP32; only Transformer projections,
-            # attention and FFNs inherit the caller's autocast policy.
+        # Only the within-mini-group time axis is sequential; B*G is parallel.
+        for t in range(self.mini_length):
             with torch.autocast(device_type=memory.device.type, enabled=False):
                 h = self.input_drop(prev.float() @ self.embedding.weight.float() +
-                                    self.latent_pos[:, t:t + 1].float())
+                                    positions[:, t:t + 1].float())
             new_cache = []
             for block, old, cross in zip(self.decoder, self_kv, cross_kv):
                 h, kv = block.step(h, old, cross)
                 new_cache.append(kv)
             self_kv = new_cache
             logits = self.head(self.dec_norm(h)).squeeze(1).float()
-            # 独立 Gumbel；硬采样分布为 softmax(logits)，与 tau 无关。
             with torch.autocast(device_type=memory.device.type, enabled=False):
-                g = -torch.empty_like(logits).exponential_().log()
-                noisy = logits + g
+                gumbel = -torch.empty_like(logits).exponential_().log()
+                noisy = logits + gumbel
                 z = noisy.argmax(-1)
                 hard = F.one_hot(z, 64).to(logits.dtype)
                 if tau is None:
-                    y = hard  # 评估：仍是随机 categorical 采样，非 argmax(logits)。
+                    y = hard
                 else:
                     soft = F.softmax(noisy / tau, -1)
                     y = hard + (soft - soft.detach())
             all_logits.append(logits)
             all_y.append(y)
             all_z.append(z)
-            prev = y[:, None, :]  # 不转换成整数索引，不 detach。
-        logits = torch.stack(all_logits, dim=1)
-        y_st = torch.stack(all_y, dim=1)
-        z = torch.stack(all_z, dim=1)
-        log_probs = F.log_softmax(logits, dim=-1)
-        # 训练：前向为精确离散 log q，反向保留 y_st 路径。
-        log_q_i = (y_st * log_probs).sum(-1)
-        # 记录：同一个硬样本的 log q；仅用于指标/一致性检查。
-        log_q_i_hard = log_probs.gather(-1, z[..., None]).squeeze(-1)
-        return dict(z=z, y_st=y_st, logits=logits, probs=log_probs.exp(),
-                    log_probs=log_probs, log_q_i=log_q_i,
-                    log_q=log_q_i.sum(-1), log_q_i_hard=log_q_i_hard,
-                    self_kv=self_kv, cross_kv=cross_kv)
+            prev = y[:, None, :]  # Keep ST gradients within each stream.
+        # Remove padded coordinates before scoring or returning to NVAE.
+        logits = self._unpack_mini(torch.stack(all_logits, dim=1), b)
+        y_st = self._unpack_mini(torch.stack(all_y, dim=1), b)
+        z = self._unpack_mini(torch.stack(all_z, dim=1), b)
+        with torch.autocast(device_type=memory.device.type, enabled=False):
+            log_probs = F.log_softmax(logits, dim=-1)
+            log_q_i = (y_st * log_probs).sum(-1)
+            log_q_i_hard = log_probs.gather(-1, z[..., None]).squeeze(-1)
+        result = dict(z=z, y_st=y_st, logits=logits, probs=log_probs.exp(),
+                      log_probs=log_probs, log_q_i=log_q_i,
+                      log_q=log_q_i.sum(-1), log_q_i_hard=log_q_i_hard)
+        if return_cache:
+            result.update(self_kv=[(kv.k, kv.v) if isinstance(kv, GrowingKV) else kv
+                                   for kv in self_kv], cross_kv=cross_kv)
+        else:
+            self_kv.clear()
+            cross_kv.clear()
+        return result
 
     def forward(self, x, tau=1.0):
         return self.sample(x, tau)
@@ -245,18 +325,20 @@ class RecognitionScale1(nn.Module):
     def teacher_logits_memory(self, memory, y):
         if tuple(y.shape) != (memory.shape[0], self.d_lat, 64):
             raise ValueError("y must be [batch, d_lat, 64]")
-        cross_kv = self.prepare_cross_kv(memory)
-        bos = y.new_zeros(y.shape[0], 1, 64)
+        b = memory.shape[0]
+        cross_kv = self._mini_cross_kv(memory)
+        packed = self._pack_mini(y)
+        bos = y.new_zeros(b * self.mini_groups, 1, 64)
         bos[..., 0] = 1.0
-        shifted = torch.cat([bos, y[:, :-1]], dim=1)
+        shifted = torch.cat([bos, packed[:, :-1]], dim=1)
         with torch.autocast(device_type=memory.device.type, enabled=False):
             h = self.input_drop(shifted.float() @ self.embedding.weight.float() +
-                                self.latent_pos.float())
-        allowed = torch.ones(self.d_lat, self.d_lat, device=memory.device,
+                                self._mini_positions(b).float())
+        allowed = torch.ones(self.mini_length, self.mini_length, device=memory.device,
                              dtype=torch.bool).tril()[None, None]
         for block, cross in zip(self.decoder, cross_kv):
             h = block.full(h, cross, allowed)
-        return self.head(self.dec_norm(h)).float()
+        return self._unpack_mini(self.head(self.dec_norm(h)).float(), b)
 
 
 

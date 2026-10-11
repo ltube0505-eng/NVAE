@@ -9,13 +9,15 @@ from test_ar_poisson import model_args, new_model
 
 @pytest.mark.parametrize('mode', ['capped64', 'exact64'])
 @pytest.mark.parametrize('objective', ['standard', 'nvae'])
-def test_actual_training_and_iw_validation_loop(mode, objective, monkeypatch):
+@pytest.mark.parametrize('mini_groups,grow', [(1, 0), (5, 3)])
+def test_actual_training_and_iw_validation_loop(mode, objective, mini_groups, grow, monkeypatch):
     pytest.importorskip('torchvision')
     pytest.importorskip('lmdb')
     import train
 
     torch.manual_seed(9)
     args = model_args(mode=mode)
+    args.ar_mini_groups, args.ar_grow_target_every = mini_groups, grow
     args.ar_poisson_objective = objective
     args.distributed = False
     args.num_total_iter = 1000
@@ -72,3 +74,4 @@ def test_actual_training_and_iw_validation_loop(mode, objective, monkeypatch):
                                     args=args, logging=logger)
     assert torch.isfinite(iw_nll) and torch.isfinite(valid_nelbo)
     assert all(torch.equal(p, weights[n]) for n, p in model.named_parameters())
+

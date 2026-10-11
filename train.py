@@ -48,6 +48,11 @@ def main(args):
     logging.info('args = %s', args)
     logging.info('param size = %fM ', utils.count_parameters_in_M(model))
     logging.info('groups per scale: %s, total_groups: %d', model.groups_per_scale, sum(model.groups_per_scale))
+    if model.ar_poisson:
+        streams = [(head.rec.d_lat, head.rec.mini_groups, head.rec.mini_length)
+                   for head in model.enc_sampler if hasattr(head, 'rec')]
+        logging.info('AR parallel streams (d_lat, mini_groups, steps): %s; grow_target_every=%d',
+                     streams, model.ar_transformer_args['grow_target_every'])
 
     standard_ar_poisson = model.ar_poisson and model.ar_poisson_objective == 'standard'
     optimizer_weight_decay = 0. if standard_ar_poisson else args.weight_decay
@@ -492,6 +497,10 @@ if __name__ == '__main__':
                         help='independent full hierarchical trajectories per AR/NAR training minibatch')
     parser.add_argument('--ar_gumbel_temperature', type=float, default=1.,
                         help='AR Gumbel-ST backward temperature; does not temper the categorical sampling law')
+    parser.add_argument('--ar_mini_groups', '--mini_group', type=int, default=1,
+                        help='independent parallel mini-groups per AR group (effective count is min(value, d_lat))')
+    parser.add_argument('--ar_grow_target_every', '--grow_target_every', type=int, default=0,
+                        help='grow self-attention KV capacity every N tokens; 0 retains exact-prefix caching')
     parser.add_argument('--ar_embed_dim', type=int, default=128)
     parser.add_argument('--ar_num_heads', type=int, default=4)
     parser.add_argument('--ar_num_layers', type=int, default=2,
