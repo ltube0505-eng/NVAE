@@ -250,7 +250,7 @@ def test_group_amp_keeps_exact_counts_and_finite_probabilities(mode):
     assert_grad(nar.parameters())
 
 
-def test_adaptive_three_scales_multichannel_order_and_max_size():
+def test_adaptive_three_scales_multichannel_order():
     args = model_args()
     args.num_latent_scales = 3
     args.num_groups_per_scale = 4
@@ -269,9 +269,10 @@ def test_adaptive_three_scales_multichannel_order_and_max_size():
     assert_grad(model.enc_sampler[0].parameters())
     assert_grad(model.enc_sampler[-1].parameters())
     assert_grad(model.dec_sampler[-1].parameters())
-    # Boundary dimension is accepted; larger dimensions are rejected separately.
-    head = ARPoissonGroup((4, 2, 2), (16, 8, 8), embed_dim=8, num_heads=2, num_layers=1)
-    assert head.rec.d_lat == 1024
+    # Sequence lengths above the former 1024-coordinate limit are accepted.
+    head = ARPoissonGroup((4, 2, 2), (17, 8, 8), embed_dim=8, num_heads=2, num_layers=1)
+    assert head.rec.d_lat == 1088
+    assert head.rec.latent_pos.shape == (1, 1088, 8)
 
 
 @pytest.mark.parametrize('key,value,match', [
@@ -279,9 +280,51 @@ def test_adaptive_three_scales_multichannel_order_and_max_size():
     ('poisson_gradient_estimator', 'relaxed', 'straight_through'),
     ('ar_poisson_mc_samples', 0, 'positive'), ('ar_gumbel_temperature', 0, 'positive'),
     ('ar_embed_dim', 7, 'even'), ('ar_num_heads', 3, 'divisible'),
-    ('ar_num_layers', 0, 'positive'), ('num_latent_per_group', 17, '1024')])
+    ('ar_num_layers', 0, 'positive'), ('num_latent_per_group', 0, 'positive')])
 def test_invalid_configuration_rejected(key, value, match):
     args = model_args()
     setattr(args, key, value)
     with pytest.raises(ValueError, match=match):
         new_model(args)
+
+@pytest.mark.parametrize('d_lat', [1025, 2048])
+def test_recognition_positions_and_teacher_scoring_above_former_limit(d_lat):
+    rec = RecognitionScale1((1, 2, 2), (1, 1), d_lat, 8, 2, 1).eval()
+    x = torch.randn(1, 1, 2, 2)
+    y = torch.nn.functional.one_hot(torch.zeros(1, d_lat, dtype=torch.long), 64).float()
+    with torch.no_grad():
+        logits = rec.teacher_logits(x, y)
+    assert rec.latent_pos.shape == (1, d_lat, 8)
+    assert logits.shape == (1, d_lat, 64) and torch.isfinite(logits).all()
+
+
+def test_nvae_and_nar_groups_above_former_limit():
+    args = model_args()
+    args.num_latent_per_group = 17
+    model = new_model(args)
+    ar_heads = [head for head in model.enc_sampler if isinstance(head, ARPoissonGroup)]
+    assert any(head.rec.d_lat > 1024 for head in ar_heads)
+    assert all(head.rec.latent_pos.shape[1] == math.prod(head.latent_shape) for head in ar_heads)
+    nar = next(head for head in model.enc_sampler
+               if isinstance(head, IndependentPoissonGroup) and math.prod(head.latent_shape) > 1024)
+    channels = nar.head[-1].in_channels
+    _, h, w = nar.latent_shape
+    feature = torch.randn(1, channels, h, w, requires_grad=True)
+    prior_raw = torch.zeros(1, *nar.latent_shape, requires_grad=True)
+    out = nar(feature, prior_raw)
+    assert out['kl_per_var'].shape == (1, math.prod(nar.latent_shape))
+    assert torch.equal(out['z_st'], out['z_hard'].float())
+    out['kl'].mean().backward()
+    assert torch.isfinite(feature.grad).all() and torch.isfinite(prior_raw.grad).all()
+
+
+@pytest.mark.parametrize('d_lat', [0, -1])
+def test_recognition_rejects_nonpositive_length(d_lat):
+    with pytest.raises(ValueError, match='positive'):
+        RecognitionScale1(d_lat=d_lat)
+
+
+@pytest.mark.parametrize('shape', [(0, 2, 2), (1, -1, 2), (-1, -1, 2)])
+def test_nar_rejects_nonpositive_dimensions(shape):
+    with pytest.raises(ValueError, match='positive'):
+        IndependentPoissonGroup(4, shape)
