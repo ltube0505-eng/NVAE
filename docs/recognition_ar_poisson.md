@@ -73,8 +73,22 @@ NAR expands exactly 64 exponential arrivals and uses sigmoid CTS-ST gradients.
 64 arrivals. Finite-sum KL and tail probability use float64 internally;
 `capped64` is a censored distribution, not a renormalized truncated Poisson.
 Evaluation removes soft gradients and retains the same selected hard law.
-All group sampling/probability operations run in float32 with autocast
-disabled, so AMP does not distort integer counts or PMF selection.
+Recognition Transformer projections, SDPA attention, FFNs, and the NAR
+convolutional head inherit the caller's autocast policy (the training loop
+already enables CUDA AMP). ST embedding/count matmuls, Gumbel/CTS sampling,
+rates and probability calculations remain float32 with autocast disabled;
+finite-sum capped KL and tail probabilities retain float64 internally.
+Logits are converted to float32 before categorical sampling and scoring.
+
+Attention uses PyTorch `scaled_dot_product_attention` with automatic backend
+selection; no FlashAttention-only hardware dependency is introduced. Encoder
+attention is unmasked, teacher-forced decoder attention uses a boolean causal
+mask (True = visible), and single-token cached steps use no extra causal mask:
+the cache already contains only past/current inputs. Attention dropout is
+explicitly zero during evaluation. Projection parameter names/shapes and the
+encoder/decoder topology are unchanged, so existing AR/NAR state dictionaries
+can still load strictly. AMP/SDPA may change floating-point results and random
+trajectories; bitwise equivalence to the old implementation is not expected.
 
 The five-item NVAE return contract is unchanged:
 `pixel_params, log_q, log_p, kl_all, kl_diag`. Group KLs sum over scalar
@@ -174,3 +188,12 @@ the `res_elu` backbone and small Transformer widths. They are not GPU training,
 dataset convergence, FID/NLL benchmarks, or gradient-unbiasedness evidence.
 
 Validation runtime: Python 3.12, PyTorch 2.14.1+cpu, torchvision 0.29.1+cpu.
+
+SDPA/AMP regression checks additionally compare outputs and gradients against
+the original attention formula, verify masks and evaluation dropout, assert
+low-precision Transformer/NAR head compute with FP32 sampling/probabilities,
+and exercise cached ST prefix gradients and full hierarchical AMP backward.
+These checks run with CPU bfloat16; CUDA float16 cases run when CUDA is
+available and otherwise skip. GPU kernel selection and throughput must be
+measured on the training server.
+

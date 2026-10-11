@@ -43,12 +43,13 @@ class MHA(nn.Module):
     def attend(self, query, kv, allowed=None):
         q = self.split(self.q(query))
         k, v = kv
-        score = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        if allowed is not None:  # True = 可以看见
-            score = score.masked_fill(~allowed, float("-inf"))
-        weights = F.softmax(score.float(), dim=-1).to(v.dtype)
-        weights = F.dropout(weights, self.attention_dropout, self.training)
-        h = weights @ v
+        # Boolean masks use True = visible, as in the original attention.
+        # Cached steps already contain only past/current inputs. Do not use
+        # is_causal=True for the non-square (one query, full prefix) case.
+        h = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=allowed,
+            dropout_p=self.attention_dropout if self.training else 0.0,
+            is_causal=False)
         h = h.transpose(1, 2).contiguous().reshape(query.shape)
         return self.out(h)
 
@@ -195,24 +196,28 @@ class RecognitionScale1(nn.Module):
         prev[..., 0] = 1.0
         all_logits, all_y, all_z = [], [], []
         for t in range(self.d_lat):
-            h = self.input_drop(prev @ self.embedding.weight +
-                                self.latent_pos[:, t:t + 1])
+            # Keep the ST embedding path in FP32; only Transformer projections,
+            # attention and FFNs inherit the caller's autocast policy.
+            with torch.autocast(device_type=memory.device.type, enabled=False):
+                h = self.input_drop(prev.float() @ self.embedding.weight.float() +
+                                    self.latent_pos[:, t:t + 1].float())
             new_cache = []
             for block, old, cross in zip(self.decoder, self_kv, cross_kv):
                 h, kv = block.step(h, old, cross)
                 new_cache.append(kv)
             self_kv = new_cache
-            logits = self.head(self.dec_norm(h)).squeeze(1)
+            logits = self.head(self.dec_norm(h)).squeeze(1).float()
             # 独立 Gumbel；硬采样分布为 softmax(logits)，与 tau 无关。
-            g = -torch.empty_like(logits).exponential_().log()
-            noisy = logits + g
-            z = noisy.argmax(-1)
-            hard = F.one_hot(z, 64).to(logits.dtype)
-            if tau is None:
-                y = hard  # 评估：仍是随机 categorical 采样，非 argmax(logits)。
-            else:
-                soft = F.softmax(noisy / tau, -1)
-                y = hard + (soft - soft.detach())
+            with torch.autocast(device_type=memory.device.type, enabled=False):
+                g = -torch.empty_like(logits).exponential_().log()
+                noisy = logits + g
+                z = noisy.argmax(-1)
+                hard = F.one_hot(z, 64).to(logits.dtype)
+                if tau is None:
+                    y = hard  # 评估：仍是随机 categorical 采样，非 argmax(logits)。
+                else:
+                    soft = F.softmax(noisy / tau, -1)
+                    y = hard + (soft - soft.detach())
             all_logits.append(logits)
             all_y.append(y)
             all_z.append(z)
@@ -246,12 +251,14 @@ class RecognitionScale1(nn.Module):
         bos = y.new_zeros(y.shape[0], 1, 64)
         bos[..., 0] = 1.0
         shifted = torch.cat([bos, y[:, :-1]], dim=1)
-        h = self.input_drop(shifted @ self.embedding.weight + self.latent_pos)
+        with torch.autocast(device_type=memory.device.type, enabled=False):
+            h = self.input_drop(shifted.float() @ self.embedding.weight.float() +
+                                self.latent_pos.float())
         allowed = torch.ones(self.d_lat, self.d_lat, device=memory.device,
                              dtype=torch.bool).tril()[None, None]
         for block, cross in zip(self.decoder, cross_kv):
             h = block.full(h, cross, allowed)
-        return self.head(self.dec_norm(h))
+        return self.head(self.dec_norm(h)).float()
 
 
 
@@ -389,9 +396,10 @@ class ARPoissonGroup(nn.Module):
                                        d_lat=math.prod(latent_shape), **kwargs)
 
     def forward(self, feature, prior_raw, tau=1.0):
-        # Sampling, one-hot/count matmuls and PMFs must remain float32 under AMP.
+        # Transformer compute inherits training autocast. Probabilities/counts
+        # stay FP32, including the ST count matmul (not autocast-safe).
+        out = self.rec(feature.float(), tau=tau)
         with torch.autocast(device_type=feature.device.type, enabled=False):
-            out = self.rec(feature.float(), tau=tau)
             return ar_group_result(out, positive_rate(prior_raw.float()), self.latent_shape)
 
 
@@ -406,11 +414,11 @@ class IndependentPoissonGroup(nn.Module):
         self.head = nn.Sequential(nn.ELU(), nn.Conv2d(feature_channels, c, 3, padding=1))
 
     def forward(self, feature, prior_raw, tau=0.1, mode="capped64"):
+        raw_q = self.head(feature.float()).float()
         with torch.autocast(device_type=feature.device.type, enabled=False):
-            return self._forward_float(feature.float(), prior_raw.float(), tau, mode)
+            return self._forward_float(raw_q, prior_raw.float(), tau, mode)
 
-    def _forward_float(self, feature, prior_raw, tau, mode):
-        raw_q = self.head(feature)
+    def _forward_float(self, raw_q, prior_raw, tau, mode):
         if self.res_dist:
             raw_q = raw_q + prior_raw
         if tuple(raw_q.shape[1:]) != self.latent_shape or raw_q.shape != prior_raw.shape:
@@ -441,3 +449,4 @@ def mixed_nelbo(log_px, group_outputs):
     return per_image.mean(), dict(nelbo=per_image.detach().mean(),
                                   recon_nll=(-log_px).detach().mean(),
                                   kl=kl.detach().mean())
+
