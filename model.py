@@ -125,7 +125,9 @@ class AutoEncoder(nn.Module):
             memory_tokens=getattr(args, 'ar_memory_tokens', 64),
             num_heads=getattr(args, 'ar_num_heads', 4),
             num_layers=getattr(args, 'ar_num_layers', 2),
-            mlp_ratio=getattr(args, 'ar_mlp_ratio', 4))
+            mlp_ratio=getattr(args, 'ar_mlp_ratio', 4),
+            mini_groups=getattr(args, 'ar_mini_groups', 1),
+            grow_target_every=getattr(args, 'ar_grow_target_every', 0))
         if self.ar_poisson:
             if int(torch.__version__.split('.')[0]) < 2 or not hasattr(torch, 'special'):
                 raise ValueError('ar_poisson requires PyTorch >= 2.0; torch 1.6 is unsupported.')
@@ -149,7 +151,10 @@ class AutoEncoder(nn.Module):
                 raise ValueError('ar_poisson fixes --poisson_max_count 64.')
             if self.ar_gumbel_temperature <= 0 or self.poisson_relaxation_temperature <= 0:
                 raise ValueError('AR Gumbel and NAR CTS temperatures must be positive.')
-            if any(value < 1 for value in self.ar_transformer_args.values()):
+            if self.ar_transformer_args['grow_target_every'] < 0:
+                raise ValueError('ar_grow_target_every must be nonnegative.')
+            if any(value < 1 for key, value in self.ar_transformer_args.items()
+                   if key != 'grow_target_every'):
                 raise ValueError('Transformer dimensions and layer counts must be positive.')
         valid_estimators = {'relaxed', 'reinforce', 'obbvi', 'straight_through'}
         if self.poisson_gradient_estimator not in valid_estimators:

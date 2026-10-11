@@ -53,7 +53,7 @@ There is no policy-search objective or Flax checkpoint loader.
 
 The shared recognition embedding table has 64 rows. Inputs are right-shifted
 `(BOS, z_0, ..., z_{T-2})`, using row 0 as BOS while keeping class 0 valid.
-Full-prefix self-attention KV caches are separate per decoder block;
+Full-prefix within-mini-group self-attention KV caches are separate per decoder block;
 cross-attention KV is computed once per group from CNN memory. Both caches
 are local variables rebuilt on every group invocation; the NVAE AR result
 does not return either cache, and explicit cache lists are cleared at the
@@ -77,6 +77,76 @@ top-down state before injecting the current group. Heads emit `C_z` raw
 rate channels, mapped by `exp(5*tanh(raw/5))`. NAR uses ELU + 3x3 Conv and
 optionally adds the prior raw parameter via `--res_dist`. The legacy
 `--poisson_max_rate` does not clip rates in this new mode.
+
+
+## Parallel mini-groups and chunk-grown KV cache
+
+`--ar_mini_groups G` (alias `--mini_group`) partitions each AR group's flat
+CHW sequence of length `T = C_z * H_g * W_g` into `min(G,T)` balanced,
+contiguous mini-groups. Defaults to 1 for the previous full-group posterior.
+Mini-groups share the recognition weights and image/fused-state memory but
+have independent BOS inputs, Gumbel draws and self-attention prefixes.
+Conditioned on that memory (and the preceding NVAE groups), the posterior is
+
+\[
+q(z_i\mid x,z_{<i})=
+\prod_{g=1}^{G_i}\prod_{t=1}^{L_g}
+q(z_{i,g,t}\mid x,z_{<i},z_{i,g,<t}).
+\]
+
+This changes the posterior family when G > 1; it is not an exact acceleration
+of the original full-group autoregressive posterior. Independence is
+conditional, not marginal across images or preceding NVAE groups. NAR groups
+already factorize over all coordinates and remain unchanged.
+
+There is one time loop of length `L = ceil(T/G_i)`, with mini-group streams
+merged into the batch axis. No Python loop over mini-groups is used.
+
+| Tensor | Shape |
+| --- | --- |
+| Original group | `[B,C_z,H_g,W_g]` |
+| Flat group | `[B,T]` |
+| Padded mini-group counts | `[B,G_i,L]` |
+| Current ST one-hot | `[B*G_i,1,64]` |
+| Current Transformer input | `[B*G_i,1,embed_dim]` |
+| Self-attention cache | `[B*G_i,num_heads,capacity,head_dim]` |
+| Cross-attention K/V | `[B*G_i,num_heads,memory_tokens,head_dim]` |
+| Returned counts | `[B,C_z,H_g,W_g]` |
+
+Lengths differing by one coordinate are padded only at stream ends. A
+device-resident index map restores the original CHW order and removes padding
+before `log_q`, Poisson `log_p`, KL and decoder inputs are computed. The same
+partition is used for teacher-forced scoring, including a separate right-shift
+and BOS per stream. Global positional encodings preserve coordinate identity.
+Image memory is encoded once per original batch; cross K/V is projected once
+per decoder layer then broadcast to mini-group streams. Metadata buffers move
+with the module to CUDA and are reconstructed from args on checkpoint load.
+
+`--ar_grow_target_every N` (alias `--grow_target_every`) follows jadex's
+[cache-capacity growth mechanism](https://github.com/mdrolet01/jadex/blob/fd0a606d9e718a7b62c4ac7733a2b7e02e71761a/jadex/networks/autoregressive_sampling.py):
+capacity grows in N-token increments, bounded by each stream's padded length.
+It does not grow latent dimensionality, discard prefixes, or sample N dependent
+tokens simultaneously. Unwritten cache slots are masked. The default 0 keeps
+the previous exact-prefix `torch.cat` cache.
+
+No-grad inference reuses storage within a capacity chunk. Training performs
+functional/cloned cache updates to preserve gradients through all prior ST
+tokens and avoid modifying tensors needed by earlier backwards. Consequently
+training still copies cache tensors; chunk growth alone is not a claim of
+GPU speedup. Parallel mini-groups reduce sequential sampling steps from T to L,
+but actual throughput and extra memory from broadcasting must be measured.
+
+Example flags to add to an existing AR/NAR training command:
+
+```bash
+--ar_mini_groups 8 --ar_grow_target_every 8
+```
+
+For `[B,4,8,8]`, T=256 becomes eight independent 32-step streams, executed
+with Transformer batch `B*8`. New options are saved in the normal checkpoint
+args. No parameter shapes or persistent state-dict keys are added; checkpoints
+without the options retain G=1 and growth=0. Use matching mini-group arguments
+when resuming training so the posterior factorization is preserved.
 
 ## Probabilities, KL, and CTS modes
 
