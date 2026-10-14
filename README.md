@@ -400,6 +400,13 @@ existing straight-through estimator. See the [mathematical definition,
 commands, implementation notes, and tests](docs/all_poisson_gradient_estimators.md).
 
 
+### Alternating AR / NAR Poisson recognition
+
+`--latent_distribution ar_poisson --num_nf 0` enables alternating 64-class
+autoregressive and independent CTS-ST posterior groups with learned ordinary
+Poisson priors. See [architecture, probability modes, training command, runtime
+requirements, and validation](docs/recognition_ar_poisson.md).
+
 ## Traversing the latent space
 We can generate images by traversing in the latent space of NVAE. This sequence is generated using our model
 trained on CelebA HQ, by interpolating between samples generated with temperature 0.6. 
