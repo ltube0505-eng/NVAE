@@ -14,6 +14,13 @@ likelihood-based generative models on several image datasets.
     <img src="img/celebahq.png" width="800">
 </p>
 
+## Optional single-layer Gaussian block model
+
+`--gaussian_block_upscale` adds Gaussian parameter upscaling and exact prior-weighted
+2×2 block selection to the single-layer path. See the [model definition, KL caveat,
+and training commands](docs/single_gaussian_block.md). The requested four-component
+KL sum is used as a regularizer; it is not generally the marginal mixture KL.
+
 ## Requirements
 NVAE is built in Python 3.7 using PyTorch 1.6.0. Use the following command to install the requirements:
 ```
