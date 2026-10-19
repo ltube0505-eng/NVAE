@@ -48,6 +48,9 @@ def main(args):
     logging.info('args = %s', args)
     logging.info('param size = %fM ', utils.count_parameters_in_M(model))
     logging.info('groups per scale: %s, total_groups: %d', model.groups_per_scale, sum(model.groups_per_scale))
+    if model.gaussian_block_upscale:
+        logging.info('Gaussian block mode: NELBO uses the unweighted four-component KL sum; '
+                     'IW-NLL uses exact marginal mixture densities. See docs/single_gaussian_block.md.')
 
     if args.fast_adamax:
         # Fast adamax has the same functionality as torch.optim.Adamax, except it is faster.
@@ -221,6 +224,8 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
                     kl_all, kl_coeff, kl_balance=True, alpha_i=alpha_i)
                 nelbo_batch = recon_loss + balanced_kl
                 loss = torch.mean(nelbo_batch)
+                if model.gaussian_block_upscale:
+                    loss = loss + model.gaussian_block_selector_correction(recon_loss).mean()
 
             reported_nelbo = torch.mean(nelbo_batch.detach())
             norm_loss = model.spectral_norm_parallel()
@@ -440,6 +445,9 @@ if __name__ == '__main__':
     parser.add_argument('--latent_distribution', type=str, default='normal',
                         choices=['normal', 'poisson', 'mixed_poisson_gamma'],
                         help='latent family; poisson makes every latent group Poisson')
+    parser.add_argument('--gaussian_block_upscale', action='store_true', default=False,
+                        help='single Gaussian layer: upscale parameters, select one of four '
+                             'positions per block using prior logits, then sample; see docs/single_gaussian_block.md')
     parser.add_argument('--poisson_gradient_estimator', type=str, default='straight_through',
                         choices=['relaxed', 'reinforce', 'obbvi', 'straight_through'],
                         help='gradient estimator used by Poisson latent groups')

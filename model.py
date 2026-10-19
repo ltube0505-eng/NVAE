@@ -18,6 +18,7 @@ from torch.distributions.bernoulli import Bernoulli
 
 from utils import get_stride_for_cell_type, get_input_size, groups_per_scale
 from distributions import Normal, Poisson, Gamma, DiscMixLogistic, NormalDecoder
+from gaussian_block import GaussianBlockLatent
 from thirdparty.inplaced_sync_batchnorm import SyncBatchNormSwish
 
 CHANNEL_MULT = 2
@@ -160,6 +161,11 @@ class AutoEncoder(nn.Module):
                                  'Use --num_latent_scales 2 --num_groups_per_scale 4 --ada_groups '
                                  '--min_groups_per_scale 2.')
         self.vanilla_vae = self.num_latent_scales == 1 and self.num_groups_per_scale == 1
+        self.gaussian_block_upscale = getattr(args, 'gaussian_block_upscale', False)
+        if self.gaussian_block_upscale and (not self.vanilla_vae or
+                                            self.latent_distribution != 'normal' or args.num_nf != 0):
+            raise ValueError('--gaussian_block_upscale requires normal latents, '
+                             'one scale, one group, and --num_nf 0.')
 
         # encoder parameteres
         self.num_channels_enc = args.num_channels_enc
@@ -187,6 +193,13 @@ class AutoEncoder(nn.Module):
                            self.input_size // spatial_scaling)
         self.prior_ftr0 = nn.Parameter(torch.rand(size=prior_ftr0_size), requires_grad=True)
         self.z0_size = [self.num_latent_per_group, self.input_size // spatial_scaling, self.input_size // spatial_scaling]
+        if self.gaussian_block_upscale:
+            self.gaussian_block = GaussianBlockLatent(self.z0_size, self.score_baseline_decay)
+            # The vanilla decoder starts directly from z; this hierarchical
+            # feature is unused. The manual gradient reducer expects a tensor
+            # for every trainable parameter, even with one GPU.
+            self.prior_ftr0.requires_grad_(False)
+        self._block_log_selection = None
 
         self.stem = self.init_stem()
         self.pre_process, mult = self.init_pre_process(mult=1)
@@ -501,8 +514,13 @@ class AutoEncoder(nn.Module):
         idx_dec = 0
         ftr = self.enc0(s)                            # this reduces the channel dimension
         param0 = self.enc_sampler[idx_dec](ftr)
-        dist = self._latent_from_param(idx_dec, param0)   # first approximate posterior
-        z, proposal_log_probs = self._sample_latent(dist, training_sample=self.training)
+        if self.gaussian_block_upscale:
+            dist, block_prior = self.gaussian_block(param0)
+            z, self._block_log_selection = dist.sample()
+            proposal_log_probs = None
+        else:
+            dist = self._latent_from_param(idx_dec, param0)   # first approximate posterior
+            z, proposal_log_probs = self._sample_latent(dist, training_sample=self.training)
         log_q_conv = dist.log_p(z)
 
         # apply normalizing flows
@@ -521,7 +539,7 @@ class AutoEncoder(nn.Module):
         s = 0
 
         # prior for z0
-        dist = self._fixed_prior(0, z)
+        dist = block_prior if self.gaussian_block_upscale else self._fixed_prior(0, z)
         log_p_conv = dist.log_p(z)
         all_p = [dist]
         all_log_p = [log_p_conv]
@@ -603,11 +621,17 @@ class AutoEncoder(nn.Module):
 
         return logits, log_q, log_p, kl_all, kl_diag
 
+    def gaussian_block_selector_correction(self, reconstruction):
+        if not self.gaussian_block_upscale or self._block_log_selection is None:
+            raise RuntimeError('Run block-upscale forward() before requesting the selector objective.')
+        return self.gaussian_block.selector_correction(reconstruction, self._block_log_selection)
+
     def sample(self, num_samples, t):
         scale_ind = 0
         z0_size = [num_samples] + self.z0_size
         reference = torch.zeros(z0_size, device=self.prior_ftr0.device)
-        dist = self._fixed_prior(0, reference, temp=t)
+        dist = self.gaussian_block.prior(num_samples, temp=t) if self.gaussian_block_upscale \
+            else self._fixed_prior(0, reference, temp=t)
         z, _ = self._sample_latent(dist, training_sample=False)
 
         idx_dec = 0
