@@ -4,7 +4,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from gaussian_block import BlockGaussian, GaussianBlockLatent, blockify, zero_insert_2x
+from gaussian_block import BlockGaussian, GaussianBlockLatent, ParameterUpscale, blockify, zero_insert_2x
 from model import AutoEncoder
 import utils
 
@@ -25,6 +25,47 @@ def test_spatial_order_and_stride_one_upscale():
     assert mean.shape == scale.shape == (1, 3, 8, 12)
     assert logits.shape == (1, 1, 8, 12)
     assert layer.prior_upscale.mean.stride == (1, 1)
+    for upscale in (layer.prior_upscale, layer.posterior_upscale):
+        for head in (upscale.mean, upscale.log_sigma, upscale.selector):
+            assert isinstance(head, torch.nn.Conv2d)
+            assert head.kernel_size == (3, 3)
+            assert head.stride == head.padding == (1, 1)
+
+
+def test_upscale_is_zero_insertion_followed_by_ordinary_convolution():
+    layer = ParameterUpscale(1, selector=True)
+    with torch.no_grad():
+        layer.selector.weight.copy_(torch.arange(18.).reshape(1, 2, 3, 3))
+        layer.selector.bias.zero_()
+    param = torch.arange(12.).reshape(1, 2, 2, 3)
+    logits = layer(param)[2]
+    expected = torch.nn.functional.conv2d(zero_insert_2x(param),
+                                          layer.selector.weight, padding=1)
+    assert torch.equal(logits, expected)
+
+
+def test_posterior_positions_depend_on_input_and_prior_is_independent():
+    layer = GaussianBlockLatent([2, 2, 3])
+    # Make the selector's input dependence deterministic, avoiding a random
+    # weight coincidence. The zero-inserted value lands at each block's 00.
+    with torch.no_grad():
+        layer.posterior_upscale.selector.weight.zero_()
+        layer.posterior_upscale.selector.weight[0, 0, 1, 1] = 1.
+        layer.posterior_upscale.selector.bias.zero_()
+    param = torch.zeros(2, 4, 2, 3, requires_grad=True)
+    with torch.no_grad():
+        param[1, 0].fill_(2.)
+    q, p = layer(param)
+    assert torch.allclose(q.log_weights[0].exp(), torch.full((1, 2, 3, 4), 0.25))
+    expected = torch.tensor([2., 0., 0., 0.]).softmax(-1)
+    assert torch.allclose(q.log_weights[1].exp(), expected.expand(1, 2, 3, 4))
+    assert torch.equal(p.log_weights[0], p.log_weights[1])
+    prior = layer.prior(2)
+    assert torch.equal(prior.log_weights, p.log_weights)
+    q.log_weights[1, 0, 0, 0, 0].backward()
+    assert param.grad[1].abs().sum() > 0
+    assert layer.posterior_upscale.selector.weight.grad.abs().sum() > 0
+    assert layer.prior_upscale.selector.weight.grad is None
 
 
 def test_selector_is_blockwise_softmax_and_shared_across_channels():
@@ -58,16 +99,36 @@ def test_density_matches_explicit_joint_channel_mixture():
 
 def test_requested_kl_sum_and_weighted_joint_upper_bound():
     torch.manual_seed(10)
-    logits = torch.randn(2, 1, 4, 6)
-    q = BlockGaussian(torch.randn(2, 3, 4, 6), torch.randn(2, 3, 4, 6), logits)
-    p = BlockGaussian(torch.randn(2, 3, 4, 6), torch.randn(2, 3, 4, 6), logits)
+    q = BlockGaussian(torch.randn(2, 3, 4, 6), torch.randn(2, 3, 4, 6),
+                      torch.randn(2, 1, 4, 6))
+    p = BlockGaussian(torch.randn(2, 3, 4, 6), torch.randn(2, 3, 4, 6),
+                      torch.randn(2, 1, 4, 6))
     components = torch.distributions.kl_divergence(
         torch.distributions.Normal(q.components.mu, q.components.sigma),
         torch.distributions.Normal(p.components.mu, p.components.sigma))
-    assert torch.allclose(q.kl(p), components.sum(-1), atol=2e-5)
-    weighted_joint_kl = (components * q.log_weights.exp()).sum(-1)
-    assert torch.all(q.kl(p) >= weighted_joint_kl - 1e-5)
+    cat_kl = torch.distributions.kl_divergence(
+        torch.distributions.Categorical(logits=q.log_weights.squeeze(1)),
+        torch.distributions.Categorical(logits=p.log_weights.squeeze(1)))
+    regularizer = q.kl(p).sum(1)
+    assert torch.allclose(regularizer, components.sum(dim=[1, 4]) + cat_kl, atol=2e-5)
+    weighted_joint_kl = (components * q.log_weights.exp()).sum(dim=[1, 4]) + cat_kl
+    assert torch.all(regularizer >= weighted_joint_kl - 1e-5)
     assert torch.allclose(q.kl(q), torch.zeros_like(q.kl(q)), atol=1e-6)
+
+
+def test_categorical_kl_counted_once_and_trains_both_selectors():
+    mean, scale = torch.zeros(2, 5, 4, 6), torch.zeros(2, 5, 4, 6)
+    q_logits = torch.randn(2, 1, 4, 6, requires_grad=True)
+    p_logits = torch.randn(2, 1, 4, 6, requires_grad=True)
+    q, p = BlockGaussian(mean, scale, q_logits), BlockGaussian(mean, scale, p_logits)
+    expected = torch.distributions.kl_divergence(
+        torch.distributions.Categorical(logits=q.log_weights.squeeze(1)),
+        torch.distributions.Categorical(logits=p.log_weights.squeeze(1))).sum(dim=[1, 2])
+    actual = q.kl(p).sum(dim=[1, 2, 3])
+    assert torch.allclose(actual, expected, atol=1e-6)
+    actual.sum().backward()
+    assert q_logits.grad.abs().sum() > 0
+    assert p_logits.grad.abs().sum() > 0
 
 
 def test_selector_score_gradient_equals_enumerated_expected_reward_gradient():
@@ -137,11 +198,15 @@ def test_model_reconstruction_prior_gradients_and_checkpoint():
                 assert parameter.grad is not None, name
                 assert torch.isfinite(parameter.grad).all(), name
         for module in (model.enc_sampler, model.gaussian_block.posterior_upscale,
+                       model.gaussian_block.posterior_upscale.selector,
                        model.gaussian_block.prior_upscale.selector, model.stem_decoder):
             assert sum(p.grad.abs().sum() for p in module.parameters()) > 0
         model.eval()
         with torch.no_grad():
-            generated = model.sample(3, 1.)
+            # A prior draw must not need the encoder or the posterior heads.
+            with patch.object(model.gaussian_block.posterior_upscale, 'forward',
+                              side_effect=AssertionError('posterior used during generation')):
+                generated = model.sample(3, 1.)
             assert decoder_inputs[-1] is samples[-1]
             assert generated.shape == (3, 1, 32, 32)
     hook.remove()

@@ -49,7 +49,8 @@ def main(args):
     logging.info('param size = %fM ', utils.count_parameters_in_M(model))
     logging.info('groups per scale: %s, total_groups: %d', model.groups_per_scale, sum(model.groups_per_scale))
     if model.gaussian_block_upscale:
-        logging.info('Gaussian block mode: NELBO uses the unweighted four-component KL sum; '
+        logging.info('Gaussian block mode: input-dependent posterior positions; '
+                     'NELBO uses the unweighted four-component KL sum plus categorical KL; '
                      'IW-NLL uses exact marginal mixture densities. See docs/single_gaussian_block.md.')
 
     if args.fast_adamax:
@@ -447,7 +448,8 @@ if __name__ == '__main__':
                         help='latent family; poisson makes every latent group Poisson')
     parser.add_argument('--gaussian_block_upscale', action='store_true', default=False,
                         help='single Gaussian layer: upscale parameters, select one of four '
-                             'positions per block using prior logits, then sample; see docs/single_gaussian_block.md')
+                             'positions per block using input-dependent posterior logits '
+                             '(prior logits for generation), then sample; see docs/single_gaussian_block.md')
     parser.add_argument('--poisson_gradient_estimator', type=str, default='straight_through',
                         choices=['relaxed', 'reinforce', 'obbvi', 'straight_through'],
                         help='gradient estimator used by Poisson latent groups')

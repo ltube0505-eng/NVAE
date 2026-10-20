@@ -28,15 +28,11 @@ class ParameterUpscale(nn.Module):
 
     def __init__(self, channels, selector=False):
         super(ParameterUpscale, self).__init__()
-        self.mean = nn.ConvTranspose2d(channels, channels, 3, stride=1, padding=1)
-        self.log_sigma = nn.ConvTranspose2d(channels, channels, 3, stride=1, padding=1)
-        self.selector = nn.ConvTranspose2d(2 * channels, 1, 3, stride=1, padding=1) \
+        self.mean = nn.Conv2d(channels, channels, 3, stride=1, padding=1)
+        self.log_sigma = nn.Conv2d(channels, channels, 3, stride=1, padding=1)
+        self.selector = nn.Conv2d(2 * channels, 1, 3, stride=1, padding=1) \
             if selector else None
-        # A zero coarse prior starts with the same Normal convention as NVAE.
-        nn.init.zeros_(self.mean.bias)
-        nn.init.zeros_(self.log_sigma.bias)
-        if self.selector is not None:
-            nn.init.zeros_(self.selector.bias)
+        # Keep the ordinary random Conv2d initialization for all heads.
 
     def forward(self, param):
         up = zero_insert_2x(param)
@@ -48,9 +44,9 @@ class ParameterUpscale(nn.Module):
 class BlockGaussian:
     """A mixture of four C-dimensional diagonal Gaussians per spatial block.
 
-    One categorical index is shared by all C channels in a block. q and p use
-    the SAME prior logits. ``kl`` deliberately returns the requested unweighted
-    component sum, which upper-bounds their marginal-mixture KL.
+    One categorical index is shared by all C channels in a block. q and p have
+    independent logits. ``kl`` returns the unweighted Gaussian component sum
+    plus categorical KL, an upper bound on the marginal-mixture KL.
     """
 
     def __init__(self, mean, log_sigma, logits, temp=1.):
@@ -76,14 +72,19 @@ class BlockGaussian:
         return torch.logsumexp(self.log_weights + component_log_p, dim=-1)
 
     def kl(self, other):
-        return self.components.kl(other.components).sum(dim=-1)
+        component_kl = self.components.kl(other.components).sum(dim=-1)
+        selector_kl = (self.log_weights.exp() *
+                       (self.log_weights - other.log_weights)).sum(dim=-1)
+        # The categorical variable is shared by C channels. Distribute its KL
+        # over channels so the existing [B,C,H,W] reduction counts it ONCE.
+        return component_kl + selector_kl / component_kl.size(1)
 
 
 class GaussianBlockLatent(nn.Module):
     def __init__(self, z_size, baseline_decay=0.9):
         super(GaussianBlockLatent, self).__init__()
         c, h, w = z_size
-        self.posterior_upscale = ParameterUpscale(c)
+        self.posterior_upscale = ParameterUpscale(c, selector=True)
         self.prior_upscale = ParameterUpscale(c, selector=True)
         self.prior_param = nn.Parameter(torch.zeros(1, 2 * c, h, w))
         self.baseline_decay = baseline_decay
@@ -99,12 +100,13 @@ class GaussianBlockLatent(nn.Module):
                              logits.expand(batch_size, -1, -1, -1), temp=temp)
 
     def forward(self, posterior_param):
-        prior_mean, prior_log_sigma, logits = self.prior_upscale(self.prior_param)
+        prior_mean, prior_log_sigma, prior_logits = self.prior_upscale(self.prior_param)
         batch_size = posterior_param.size(0)
-        logits = logits.expand(batch_size, -1, -1, -1)
-        mean, log_sigma, _ = self.posterior_upscale(posterior_param)
-        posterior = BlockGaussian(mean, log_sigma, logits)
-        prior = BlockGaussian(prior_mean.expand_as(mean), prior_log_sigma.expand_as(log_sigma), logits)
+        prior_logits = prior_logits.expand(batch_size, -1, -1, -1)
+        mean, log_sigma, posterior_logits = self.posterior_upscale(posterior_param)
+        posterior = BlockGaussian(mean, log_sigma, posterior_logits)
+        prior = BlockGaussian(prior_mean.expand_as(mean), prior_log_sigma.expand_as(log_sigma),
+                              prior_logits)
         return posterior, prior
 
     def selector_correction(self, reconstruction, log_selection):
@@ -112,7 +114,8 @@ class GaussianBlockLatent(nn.Module):
 
         The baseline uses ONLY previous minibatches, avoiding same-batch bias.
         Gaussian parameters and decoder retain their ordinary pathwise gradient.
-        The unweighted component KL has no dependence on the categorical draw.
+        The component sum and categorical KL are analytic and do not depend on
+        the categorical draw, so only reconstruction needs this correction.
         """
         baseline = self.reconstruction_baseline.detach().clone()
         score = (reconstruction.detach().float() - baseline) * log_selection
