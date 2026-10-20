@@ -95,18 +95,20 @@ MNIST 的 reconstruction loss 仍为裁剪到 28×28 的 Bernoulli 负对数似�
 
 ## KL 正则与评估
 
-保留原分支指定的四项**不加权** Gaussian KL 求和：
-
-\[
-R_{sum}(x)=\sum_b\sum_k D_{KL}(g^q_{b,k}(\cdot\mid x)\Vert g^p_{b,k}).
-\]
-
-后验、先验不再共用位置概率，因此补充解析 categorical KL：
+采用后验位置概率加权的 Gaussian KL 与 categorical KL：
 
 \[
 R_{pos}(x)=\sum_b\sum_k q_{b,k}(x)\log\frac{q_{b,k}(x)}{p_{b,k}},
-\qquad R(x)=R_{sum}(x)+R_{pos}(x).
 \]
+
+\[
+R_{Gauss}(x)=\sum_b\sum_k q_{b,k}(x)
+D_{KL}(g^q_{b,k}(\cdot\mid x)\Vert g^p_{b,k}),
+\qquad R(x)=R_{pos}(x)+R_{Gauss}(x).
+\]
+
+Gaussian KL 使用各位置的后验概率 q 加权，不再对四个分量不加权求和。
+位置概率不 detach，梯度通过权重反传到后验 selector 和编码器。
 
 位置变量由 C 个 channel 共享，`R_pos` 在每个块只计算一次。
 代码为保持 `[B,C,H,W]` 接口，将该项平均分配到 C 个 channel，
@@ -115,21 +117,23 @@ R_{pos}(x)=\sum_b\sum_k q_{b,k}(x)\log\frac{q_{b,k}(x)}{p_{b,k}},
 训练目标为
 
 \[
-L=L_{rec}+\beta(t)(R_{sum}+R_{pos})+\text{原 NVAE 正则项}.
+L=L_{rec}+\beta(t)(R_{pos}+R_{Gauss})+\text{原 NVAE 正则项}.
 \]
 
-两个 KL 项均解析求导。由于分量 KL 非负，
+两个 KL 项均解析计算，位置概率对四个位置完整求和，无需抽样估计。
+这个正则恰好是保留离散位置 K 时的联合 KL：
 
 \[
-D_{KL}(\widehat q\Vert\widehat p)
+D_{KL}(\widehat q(z\mid x)\Vert\widehat p(z))
 \le D_{KL}(q(K,z\mid x)\Vert p(K,z))
-=R_{pos}+\sum_b\sum_k q_{b,k}D_{KL}(g^q_{b,k}\Vert g^p_{b,k})
-\le R_{pos}+R_{sum}.
+=R_{pos}+\sum_b\sum_k q_{b,k}(x)D_{KL}(g^q_{b,k}\Vert g^p_{b,k})
+=R(x).
 \]
 
-因此这个正则仍为边缘混合 KL 的上界，并非其闭式等式。
-日志中的 `NELBO` 应理解为使用该较松正则的目标；不把 `R_sum` 单独
-当作不同位置概率下的完整 KL。β=1 时期望重建项加 R 给出 NLL 上界；
+它是边缘混合 KL 的上界，并非边缘混合 KL 的闭式等式。
+它不大于原来的 categorical KL 加四项不加权 Gaussian KL 的上界。
+β=1 时，期望重建项加 R 是扩充潜变量 `(K,z)` 模型的负 ELBO，
+给出 NLL 上界；日志中的 `NELBO` 使用这个联合 KL。
 β<1 的退火阶段不作同一上界保证。
 
 IW 评估仍使用真实边缘混合密度，各自使用自己的位置概率：
@@ -155,6 +159,7 @@ IW 评估仍使用真实边缘混合密度，各自使用自己的位置概率�
 
 REINFORCE 训练后验 selector 并通过参数场反传到编码器。
 先验 selector 由解析 categorical KL 训练，不接收后验选择的重建 reward。
+后验 selector 同时接收 categorical KL 和加权 Gaussian KL 的解析梯度。
 两个 KL 项不依赖抽中的 K，解析梯度直接反传，不加入随机 reward。
 
 baseline 为过去 minibatch 重建损失的 EMA，默认 decay=0.9，初值为零，
@@ -200,7 +205,7 @@ bash -n scripts/train_mnist_single_gaussian_block.sh
 ```
 
 测试覆盖零插入与普通卷积、块顺序、输入相关的后验位置概率、输入无关的先验、
-共享位置采样频率、边缘混合密度、独立概率下的解析正则及 categorical KL 计数、
+共享位置采样频率、边缘混合密度、独立概率下的加权联合 KL 及 categorical KL 计数、加权项的位置概率梯度、
 两个 selector 的梯度、精确枚举的 REINFORCE 梯度、真实解码器输入、
 训练/生成、checkpoint 和关闭开关的兼容性。CPU 小模型测试使用 `res_elu`，
 关闭依赖分布式初始化的 data init，不能替代 GPU AMP、多 GPU 或完整训练。

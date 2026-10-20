@@ -97,7 +97,7 @@ def test_density_matches_explicit_joint_channel_mixture():
     assert torch.allclose(q.log_p(z), expected, atol=2e-5)
 
 
-def test_requested_kl_sum_and_weighted_joint_upper_bound():
+def test_regularizer_equals_weighted_joint_kl():
     torch.manual_seed(10)
     q = BlockGaussian(torch.randn(2, 3, 4, 6), torch.randn(2, 3, 4, 6),
                       torch.randn(2, 1, 4, 6))
@@ -110,10 +110,27 @@ def test_requested_kl_sum_and_weighted_joint_upper_bound():
         torch.distributions.Categorical(logits=q.log_weights.squeeze(1)),
         torch.distributions.Categorical(logits=p.log_weights.squeeze(1)))
     regularizer = q.kl(p).sum(1)
-    assert torch.allclose(regularizer, components.sum(dim=[1, 4]) + cat_kl, atol=2e-5)
     weighted_joint_kl = (components * q.log_weights.exp()).sum(dim=[1, 4]) + cat_kl
-    assert torch.all(regularizer >= weighted_joint_kl - 1e-5)
+    assert torch.allclose(regularizer, weighted_joint_kl, atol=2e-5)
+    unweighted_bound = components.sum(dim=[1, 4]) + cat_kl
+    assert torch.all(regularizer <= unweighted_bound + 1e-5)
     assert torch.allclose(q.kl(q), torch.zeros_like(q.kl(q)), atol=1e-6)
+
+
+def test_weighted_component_kl_backpropagates_into_position_probabilities():
+    # q_pos == p_pos at this point, so categorical KL has zero gradient.
+    # Unequal Gaussian KLs must still train q_pos through its weights.
+    logits = torch.tensor([0.2, -0.3, 0.7, -0.1], requires_grad=True)
+    means = torch.tensor([0., 1., 2., 3.]).reshape(1, 1, 2, 2)
+    zeros = torch.zeros_like(means)
+    q = BlockGaussian(means, zeros, logits.reshape(1, 1, 2, 2))
+    p = BlockGaussian(zeros, zeros, logits.detach().reshape(1, 1, 2, 2))
+    costs = q.components.kl(p.components).detach().reshape(4)
+    probs = logits.softmax(-1).detach()
+    expected_gradient = probs * (costs - (probs * costs).sum())
+    q.kl(p).sum().backward()
+    assert expected_gradient.abs().sum() > 0
+    assert torch.allclose(logits.grad, expected_gradient, atol=1e-6)
 
 
 def test_categorical_kl_counted_once_and_trains_both_selectors():

@@ -45,8 +45,8 @@ class BlockGaussian:
     """A mixture of four C-dimensional diagonal Gaussians per spatial block.
 
     One categorical index is shared by all C channels in a block. q and p have
-    independent logits. ``kl`` returns the unweighted Gaussian component sum
-    plus categorical KL, an upper bound on the marginal-mixture KL.
+    independent logits. ``kl`` returns the posterior-weighted Gaussian KL sum
+    plus categorical KL: the joint (K,z) KL, which bounds marginal-mixture KL.
     """
 
     def __init__(self, mean, log_sigma, logits, temp=1.):
@@ -72,8 +72,9 @@ class BlockGaussian:
         return torch.logsumexp(self.log_weights + component_log_p, dim=-1)
 
     def kl(self, other):
-        component_kl = self.components.kl(other.components).sum(dim=-1)
-        selector_kl = (self.log_weights.exp() *
+        weights = self.log_weights.exp()
+        component_kl = (weights * self.components.kl(other.components)).sum(dim=-1)
+        selector_kl = (weights *
                        (self.log_weights - other.log_weights)).sum(dim=-1)
         # The categorical variable is shared by C channels. Distribute its KL
         # over channels so the existing [B,C,H,W] reduction counts it ONCE.
@@ -114,8 +115,8 @@ class GaussianBlockLatent(nn.Module):
 
         The baseline uses ONLY previous minibatches, avoiding same-batch bias.
         Gaussian parameters and decoder retain their ordinary pathwise gradient.
-        The component sum and categorical KL are analytic and do not depend on
-        the categorical draw, so only reconstruction needs this correction.
+        The weighted component sum and categorical KL are analytic and do not
+        depend on the categorical draw, so only reconstruction needs correction.
         """
         baseline = self.reconstruction_baseline.detach().clone()
         score = (reconstruction.detach().float() - baseline) * log_selection

@@ -50,7 +50,7 @@ def main(args):
     logging.info('groups per scale: %s, total_groups: %d', model.groups_per_scale, sum(model.groups_per_scale))
     if model.gaussian_block_upscale:
         logging.info('Gaussian block mode: input-dependent posterior positions; '
-                     'NELBO uses the unweighted four-component KL sum plus categorical KL; '
+                     'NELBO uses posterior-weighted Gaussian KL plus categorical KL (joint KL); '
                      'IW-NLL uses exact marginal mixture densities. See docs/single_gaussian_block.md.')
 
     if args.fast_adamax:

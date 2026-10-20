@@ -19,9 +19,9 @@ likelihood-based generative models on several image datasets.
 `--gaussian_block_upscale` adds zero-insertion upscaling, ordinary 3×3 convolutions,
 and exact 2×2 block selection with input-dependent posterior probabilities and
 independent learned prior probabilities. See the [model definition, KL caveat,
-and training commands](docs/single_gaussian_block.md). The requested four-component
-KL sum plus categorical KL is used as a regularizer; it is not generally the
-marginal mixture KL. Unconditional generation draws from the learned block prior.
+and training commands](docs/single_gaussian_block.md). The posterior-weighted
+Gaussian KL sum plus categorical KL is the joint (position, z) KL and upper-bounds
+the marginal mixture KL. Unconditional generation draws from the learned block prior.
 
 ## Requirements
 NVAE is built in Python 3.7 using PyTorch 1.6.0. Use the following command to install the requirements:
