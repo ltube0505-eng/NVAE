@@ -48,6 +48,9 @@ def main(args):
     logging.info('args = %s', args)
     logging.info('param size = %fM ', utils.count_parameters_in_M(model))
     logging.info('groups per scale: %s, total_groups: %d', model.groups_per_scale, sum(model.groups_per_scale))
+    if model.learnable_prior:
+        logging.info('Gaussian prior: learnable mean and log-scale per C,H,W coordinate; '
+                     'shared across images. Raw parameter shape: %s', tuple(model.prior_param.shape))
     if model.gaussian_block_upscale:
         logging.info('Gaussian block mode: NELBO uses the unweighted four-component KL sum; '
                      'IW-NLL uses exact marginal mixture densities. See docs/single_gaussian_block.md.')
@@ -72,6 +75,9 @@ def main(args):
     if args.cont_training:
         logging.info('loading the model.')
         checkpoint = torch.load(checkpoint_file, map_location='cpu')
+        if bool(getattr(checkpoint['args'], 'learnable_prior', False)) != model.learnable_prior:
+            raise ValueError('Cannot resume across fixed/learnable prior modes: model and optimizer '
+                             'parameter sets differ. Start a new run with a different --save.')
         init_epoch = checkpoint['epoch']
         model.load_state_dict(checkpoint['state_dict'])
         model = model.cuda()
@@ -448,6 +454,9 @@ if __name__ == '__main__':
     parser.add_argument('--gaussian_block_upscale', action='store_true', default=False,
                         help='single Gaussian layer: upscale parameters, select one of four '
                              'positions per block using prior logits, then sample; see docs/single_gaussian_block.md')
+    parser.add_argument('--learnable_prior', action='store_true', default=False,
+                        help='learn an image-independent diagonal Gaussian prior per C,H,W coordinate '
+                             'for the single-layer normal baseline; block mode already learns its prior')
     parser.add_argument('--poisson_gradient_estimator', type=str, default='straight_through',
                         choices=['relaxed', 'reinforce', 'obbvi', 'straight_through'],
                         help='gradient estimator used by Poisson latent groups')

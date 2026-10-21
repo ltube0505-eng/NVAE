@@ -10,8 +10,42 @@
 ```
 
 这是一个随机潜变量层；四个位置是同一层的混合分量，不是四个层级。
-未打开新开关时，不创建任何新参数，旧参数配置与 state_dict 仍兼容。
+未打开 block 或 learnable_prior 开关时，不创建任何新参数，旧参数配置与 state_dict 仍兼容。
 打开后必须重新训练；原 Gaussian checkpoint 没有本模块的参数。
+
+## 普通 Gaussian 基线：可学习先验
+
+不使用 block 上采样时，通过 `--learnable_prior` 开启可学习对角高斯先验：
+
+\[
+p_\theta(z)=\prod_{c,h,w}\mathcal N(z_{c,h,w};\mu_{c,h,w},\sigma_{c,h,w}^2).
+\]
+
+`model.prior_param` 的形状是 `[1,2C,H,W]`，前后各 C 个通道分别为
+原始均值和 log_sigma。参数在所有输入图像之间共享，每个空间位置和通道
+各有自己的参数；沿用 `Normal` 的 soft clamp 和尺度公式。
+零初始化与旧固定先验完全一致：有效均值为 0，标准差为 1.01（仓库有 +0.01）。
+训练时原有解析 Gaussian KL 对这些参数求梯度，由同一个 Adamax 优化器更新。
+有 normalizing flow 时仍使用原有采样 KL。训练 log_p、IW-NLL 与先验生成
+统一读取这套参数；生成温度 t 只缩放标准差。
+
+本开关限定为 `normal`、一层、一组且关闭 `gaussian_block_upscale`；
+block 模式自身已有可学习先验。单层模型不使用的 `prior_ftr0` 被冻结，
+避免原手动分布式梯度归约访问不存在的梯度。
+
+与 baseline 日志相同的网络和优化超参数（400 epochs、batch 200、lr 0.01）：
+
+```bash
+CUDA_VISIBLE_DEVICES=1 PYTHON=/root/miniconda3/envs/nvae/bin/python \
+  bash scripts/train_mnist_single_gaussian_learnable_prior.sh
+```
+
+MNIST 的 C=20、H=W=8，因此新增 2560 个先验参数。默认保存至
+`/root/autodl-tmp/nvae-checkpoints/eval-mnist_single_gaussian_learnable_prior/checkpoint.pt`。
+新开关会保存到 checkpoint args，先验参数保存到 state_dict；原评估入口会自动恢复。
+旧 checkpoint 中没有此开关时仍构造固定先验，可严格加载；
+不支持将旧固定先验 checkpoint 直接以 `--cont_training --learnable_prior` 续训，
+因为模型与 optimizer 的参数集合不同。本脚本应作为新实验启动。
 
 ## 两个必须明确的数学细节
 
@@ -251,8 +285,9 @@ python evaluate.py \
 ## 验证与文件
 
 ```bash
-python -m pytest -q tests/test_gaussian_block.py tests/test_mixed_distributions.py tests/test_mixed_model.py
+python -m pytest -q tests/test_learnable_prior.py tests/test_gaussian_block.py tests/test_mixed_distributions.py tests/test_mixed_model.py
 bash -n scripts/train_mnist_single_gaussian_block.sh
+bash -n scripts/train_mnist_single_gaussian_learnable_prior.sh
 ```
 
 新测试覆盖块顺序、上采样形状、共享位置及非均匀抽样频率、真实混合密度、

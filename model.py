@@ -162,6 +162,12 @@ class AutoEncoder(nn.Module):
                                  '--min_groups_per_scale 2.')
         self.vanilla_vae = self.num_latent_scales == 1 and self.num_groups_per_scale == 1
         self.gaussian_block_upscale = getattr(args, 'gaussian_block_upscale', False)
+        self.learnable_prior = getattr(args, 'learnable_prior', False)
+        if self.learnable_prior and (not self.vanilla_vae or
+                                     self.latent_distribution != 'normal' or self.gaussian_block_upscale):
+            raise ValueError('--learnable_prior requires normal latents, one scale, '
+                             'one group, and no --gaussian_block_upscale '
+                             '(block mode already has its own learnable prior).')
         if self.gaussian_block_upscale and (not self.vanilla_vae or
                                             self.latent_distribution != 'normal' or args.num_nf != 0):
             raise ValueError('--gaussian_block_upscale requires normal latents, '
@@ -193,8 +199,14 @@ class AutoEncoder(nn.Module):
                            self.input_size // spatial_scaling)
         self.prior_ftr0 = nn.Parameter(torch.rand(size=prior_ftr0_size), requires_grad=True)
         self.z0_size = [self.num_latent_per_group, self.input_size // spatial_scaling, self.input_size // spatial_scaling]
+        if self.learnable_prior:
+            # Independent, image-independent raw mean/log-scale at every C,H,W
+            # coordinate. Zero initialization matches the old Normal prior.
+            self.prior_param = nn.Parameter(torch.zeros(1, 2 * self.num_latent_per_group,
+                                                       *self.z0_size[1:]))
         if self.gaussian_block_upscale:
             self.gaussian_block = GaussianBlockLatent(self.z0_size, self.score_baseline_decay)
+        if self.vanilla_vae:
             # The vanilla decoder starts directly from z; this hierarchical
             # feature is unused. The manual gradient reducer expects a tensor
             # for every trainable parameter, even with one GPU.
@@ -430,6 +442,15 @@ class AutoEncoder(nn.Module):
                            max_rate=self.poisson_max_rate)
         return Gamma(zeros, zeros, temp=temp)
 
+    def _first_prior(self, reference, temp=1.):
+        """Use the same z0 prior for ELBO/IW density and prior generation."""
+        if self.gaussian_block_upscale:
+            return self.gaussian_block.prior(reference.size(0), temp=temp)
+        if self.learnable_prior:
+            param = self.prior_param.expand(reference.size(0), -1, -1, -1)
+            return self._latent_from_param(0, param, temp=temp)
+        return self._fixed_prior(0, reference, temp=temp)
+
     def set_obbvi_component(self, component):
         if component < 0 or component >= len(self.obbvi_taus):
             raise ValueError('O-BBVI component index is out of range.')
@@ -539,7 +560,7 @@ class AutoEncoder(nn.Module):
         s = 0
 
         # prior for z0
-        dist = block_prior if self.gaussian_block_upscale else self._fixed_prior(0, z)
+        dist = block_prior if self.gaussian_block_upscale else self._first_prior(z)
         log_p_conv = dist.log_p(z)
         all_p = [dist]
         all_log_p = [log_p_conv]
@@ -630,8 +651,7 @@ class AutoEncoder(nn.Module):
         scale_ind = 0
         z0_size = [num_samples] + self.z0_size
         reference = torch.zeros(z0_size, device=self.prior_ftr0.device)
-        dist = self.gaussian_block.prior(num_samples, temp=t) if self.gaussian_block_upscale \
-            else self._fixed_prior(0, reference, temp=t)
+        dist = self._first_prior(reference, temp=t)
         z, _ = self._sample_latent(dist, training_sample=False)
 
         idx_dec = 0
