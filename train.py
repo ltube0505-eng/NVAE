@@ -431,7 +431,7 @@ if __name__ == '__main__':
     parser.add_argument('--num_x_bits', type=int, default=8,
                         help='The number of bits used for representing data for colored images.')
     # latent variables
-    parser.add_argument('--scale_connection', type=str, default='feature',
+    parser.add_argument('--scale_connection', type=str, default='last_sample',
                         choices=['feature', 'last_sample'],
                         help='cross-scale connection: original features or only the previous '
                              'scale last sample, used for the next scale first group')
@@ -441,14 +441,15 @@ if __name__ == '__main__':
                         help='number of groups of latent variables per scale')
     parser.add_argument('--num_latent_per_group', type=int, default=20,
                         help='number of channels in latent variables per group')
-    parser.add_argument('--latent_distribution', type=str, default='normal',
+    parser.add_argument('--latent_distribution', type=str, default='poisson',
                         choices=['normal', 'poisson', 'mixed_poisson_gamma'],
                         help='latent family; poisson makes every latent group Poisson')
     parser.add_argument('--poisson_gradient_estimator', type=str, default='straight_through',
                         choices=['relaxed', 'reinforce', 'obbvi', 'straight_through'],
-                        help='gradient estimator used by Poisson latent groups')
+                        help='Poisson gradient estimator; straight_through uses exact counts '
+                             'and the rate-identity STE backward path')
     parser.add_argument('--poisson_relaxation_temperature', type=float, default=0.1,
-                        help='sigmoid temperature for relaxed/ST Poisson arrival indicators')
+                        help='sigmoid temperature for relaxed Poisson arrival indicators (unused by STE)')
     parser.add_argument('--poisson_max_count', type=int, default=64,
                         help='number of exponential arrivals used by relaxed Poisson sampling')
     parser.add_argument('--poisson_max_rate', type=float, default=30.,
@@ -533,3 +534,4 @@ if __name__ == '__main__':
         print('starting in debug mode')
         args.distributed = True
         init_processes(0, size, main, args)
+

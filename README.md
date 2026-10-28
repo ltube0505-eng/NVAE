@@ -14,7 +14,17 @@ likelihood-based generative models on several image datasets.
     <img src="img/celebahq.png" width="800">
 </p>
 
-## Optional sample-only scale connections
+## All-Poisson latents with STE (this branch)
+
+New training defaults to `--latent_distribution poisson
+--poisson_gradient_estimator straight_through --scale_connection last_sample`.
+Every latent prior and posterior is Poisson. During training, each sample is an
+exact Poisson integer with the rate-identity straight-through gradient:
+`z = torch.poisson(rate.detach()) + (rate - rate.detach())`.
+Evaluation and prior generation use exact Poisson sampling too. Keep `--num_nf 0`.
+See [the branch guide and training command](docs/scale_last_sample_poisson_ste.md).
+
+## Sample-only scale connections
 
 Use `--scale_connection last_sample` to connect latent-condition scales only through the previous
 scale's last sampled latent group. Each scale has its own randomly initialized,
@@ -23,8 +33,9 @@ first prior/posterior; within-scale latent-condition features then restart indep
 A separate image decoder uses the original NVAE feature-connected architecture to
 combine every sampled latent group from every scale, so the image likelihood is
 conditioned on all scales. Image-decoder features never feed back into latent heads.
-All latent KL terms are retained. The default `--scale_connection feature` preserves
-the original architecture and old checkpoints.
+All latent KL terms are retained. Explicit `--scale_connection feature` selects
+the original architecture. Model loading keeps the legacy Normal/feature fallback
+when old checkpoint args lack these fields.
 
 See [the detailed algorithm, training example and validation notes](docs/scale_last_sample_bridge.md).
 
@@ -446,3 +457,4 @@ Please cite our paper, if you happen to use this codebase:
   year={2020}
 }
 ```
+

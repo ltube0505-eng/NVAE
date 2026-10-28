@@ -2,10 +2,11 @@
 
 ## 开关和约定
 
-训练时增加 `--scale_connection last_sample` 启用本架构。默认值
-`feature` 保留原来的 NVAE 特征图连接；旧 checkpoint 的 args 缺少该字段时也使用
-`feature`。本实现基于本仓库 master，保留已有 Normal、Poisson 和混合
-Poisson/Gamma 分布及其采样、KL 和梯度估计实现。
+本分支新训练默认使用 `--scale_connection last_sample`、全 Poisson 隐变量和 rate-STE。
+显式指定 `--scale_connection feature` 可选择原来的 NVAE 特征图连接；旧 checkpoint 的
+args 缺少该字段时仍使用 `feature`。Normal 和混合 Poisson/Gamma 仍可显式选择。
+Poisson STE 的前向已改为精确整数采样，反向使用 rate 的恒等代理梯度，详见
+[全 Poisson + STE 分支说明](scale_last_sample_poisson_ste.md)。
 
 本文按**生成顺序**编号 scale：s=1 是分辨率最小的 scale，s=S 是最接近图像输出的
 scale。第 s 个 scale 有 G_s 组样本，记为 z_(s,1), ..., z_(s,G_s)。代码中的
@@ -143,7 +144,8 @@ J(x) = E_q[-log p(x | Z_1,...,Z_S)] + sum_(s=1..S) sum_(g=1..G_s) K_(s,g)(x)
 Normal 未使用 flow 时、Poisson、Gamma 继续使用仓库已有的解析条件 KL；
 使用 flow 时继续使用 log q - log p 估计。训练中的 KL annealing、KL balancing、
 谱正则和 BN 正则沿用原实现，它们应与单位 KL 权重的理论负 ELBO 区分。
-Poisson 的 relaxed/ST 仍是已有近似训练估计器，本架构不改变其估计偏差或截断设置。
+Poisson 的 relaxed/STE 都是有偏训练估计器；本分支 STE 使用精确 Poisson 前向，
+只有 relaxed 模式受有限到达序列截断影响。
 
 前面 scale 的样本既参与图像 decoder，也通过末组样本影响下一 scale 首组的分布。
 仅改变跨尺度条件结构，不删除任何 scale 的重建输入或 KL。
@@ -214,3 +216,4 @@ CPU 测试只对旧代码中 AR mask 和谱正则的硬编码 `.cuda()` 分配�
 实际模型计算和反向传播均执行；同步测试使用模拟 all_reduce。
 未运行真实 GPU、多 GPU、原 PyTorch 1.6 环境或完整数据集训练，未报告收敛、FID 或 NLL 改善。
 本改动没有更新原有依赖版本，也没有改造旧 CUDA/BN 实现。
+

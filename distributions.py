@@ -54,8 +54,10 @@ class Poisson:
     """Poisson latent with exact, relaxed, ST, and O-BBVI sampling helpers.
 
     ``relaxed`` uses the exponential-arrival construction used by PoissonVAE
-    and NegBio-VAE.  ``straight_through`` has an integer forward value and the
-    same relaxed backward path.  Score-function estimators use ``exact``.
+    and NegBio-VAE. ``straight_through`` samples an exact Poisson integer and
+    uses the rate as its backward surrogate (dz/d(rate) = 1). This is a biased
+    gradient estimator, with no arrival-count truncation. Score-function
+    estimators use ``exact``.
 
     For O-BBVI, a dispersion coefficient ``tau`` defines the proposal
     ``Poisson(rate ** (1 / tau))``.  This is the overdispersed exponential-
@@ -109,14 +111,15 @@ class Poisson:
                 raise ValueError('proposal_tau is required for O-BBVI sampling.')
             return torch.poisson(self.proposal_rate(proposal_tau)), None
 
-        hard_count, soft_count = self._arrival_counts()
-        if estimator == 'relaxed':
-            return soft_count, None
         if estimator == 'straight_through':
-            # Parenthesize the zero-valued term so the stored forward value is
-            # bit-for-bit the integer hard count (not hard + round-off noise).
-            count = hard_count + (soft_count - soft_count.detach())
+            hard_count = torch.poisson(self.rate.detach())
+            # Exact integer forward values; identity surrogate with respect to
+            # rate, followed by the usual chain rule through its parameterization.
+            count = hard_count + (self.rate - self.rate.detach())
             return count, None
+        if estimator == 'relaxed':
+            _, soft_count = self._arrival_counts()
+            return soft_count, None
         raise ValueError('Unknown Poisson estimator: %s' % estimator)
 
     def log_p(self, samples):
@@ -355,3 +358,4 @@ class DiscMixLogistic:
         x = torch.cat([x0, x1, x2], 1)
         x = x / 2. + 0.5
         return x
+

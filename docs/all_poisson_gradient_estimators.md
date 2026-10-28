@@ -11,11 +11,11 @@
 | 取值 | 前向 latent | 后向估计 | 是否无偏估计离散目标 |
 | --- | --- | --- | --- |
 | `relaxed` | 连续 soft count | 到达时间的路径梯度 | 否，优化连续松弛目标 |
-| `straight_through` | 整数 hard count | soft count 的路径梯度 | 否，hard-forward/soft-backward |
+| `straight_through` | 精确 Poisson 整数 | rate-identity STE，dz/dλ = 1 | 否，是有偏代理梯度 |
 | `reinforce` | 从后验精确采样的整数 | score function + 上一批次 EMA baseline | 是 |
 | `obbvi` | 从过度离散 proposal 精确采样的整数 | DMIS importance-weighted score function + EMA baseline | 是（支撑覆盖且矩存在时） |
 
-`relaxed` 与 `straight_through` 使用同一组指数到达时间
+只有 `relaxed` 使用有限指数到达时间
 
 \[
 E_k\sim\operatorname{Exp}(\lambda),\qquad
@@ -30,10 +30,12 @@ T_k=\sum_{j\le k}E_j,
 \]
 
 - `relaxed` 直接把 \(\widetilde z\) 送入 decoder；
-- `straight_through` 的实际张量为
-  \(z_{\rm hard}+\widetilde z-\operatorname{stopgrad}(\widetilde z)\)，所以前向是整数、反向使用松弛梯度。
+- `straight_through` 使用 `hard = torch.poisson(rate.detach())`，返回
+  `hard + (rate - rate.detach())`，前向精确采样 Poisson 整数，反向对 rate 使用恒等代理梯度。
 
-这一区分与 NegBio-VAE 中 Poisson/Gamma-arrival 松弛的语义一致，避免把“连续松弛”和“straight-through”误称为同一种估计器。
+STE 不使用到达时间、`poisson_max_count` 或 `poisson_relaxation_temperature`。
+`poisson_max_rate` 仍限制分布的 rate，但不限制采样整数的最大值。
+这与父分支的 hard-arrival/soft-backward ST 不同；STE 梯度仍是有偏估计。
 
 ## 2. REINFORCE 目标
 
@@ -138,10 +140,9 @@ python train.py ... --latent_distribution poisson --num_nf 0 \
   --obbvi_taus 1.0,3.0 --obbvi_num_samples 8 \
   --score_baseline_decay 0.9
 
-# 原有 hard-forward / soft-backward 方法
+# 精确 Poisson 前向 + rate-identity STE
 python train.py ... --latent_distribution poisson --num_nf 0 \
-  --poisson_gradient_estimator straight_through \
-  --poisson_relaxation_temperature 0.2 --poisson_max_count 64
+  --poisson_gradient_estimator straight_through
 ```
 
 验证与生成始终使用目标后验/先验的精确 `torch.poisson` 整数采样，不使用松弛值或 O-BBVI proposal。
@@ -163,4 +164,5 @@ pytest -q
 6. 全模型 REINFORCE surrogate 可反向传播；
 7. 全模型 O-BBVI 产生有限且有界的 DMIS 权重；
 8. 生成路径仍使用精确 Poisson 先验采样。
+
 

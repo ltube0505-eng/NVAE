@@ -66,14 +66,16 @@ $$
 =\lambda_q\log\frac{\lambda_q}{\lambda_p}+\lambda_p-\lambda_q.
 $$
 
-重建项必须经过 sampled count 回传。本实现把 Poisson process 写成指数到达时间 $T_k=\sum_{j\le k}E_j$，$E_j\sim\operatorname{Exp}(\lambda)$，并将指示函数 $\mathbf 1[T_k\le1]$ 的反向传播替换为 sigmoid 松弛。前向值用 hard integer count，反向值用 soft surrogate，即 straight-through estimator。
+重建项经过 sampled count 回传。本分支的 `straight_through` 使用 rate-identity STE：
+`hard = torch.poisson(rate.detach())`，`z = hard + (rate - rate.detach())`。
 
-- 训练：hard-forward / soft-backward 的到达时间松弛。
+- 训练：精确 Poisson 整数前向，反向对 rate 的代理导数为 1。
 - 验证：精确 `torch.poisson` 后验采样并计算精确 Poisson log-probability。
 - 生成：所有 Poisson 先验均使用精确 `torch.poisson` 采样。
 - 条件 KL：始终使用解析式。
 
-为控制有限到达序列的截断误差，默认 `max_rate=30`、`max_count=64`。训练前向 count 仍可能在极小概率下被截断；生成没有该截断。
+默认 `max_rate=30` 限制 rate，但不截断 STE 的采样值；`max_count=64` 和松弛温度
+仅影响显式选择的 `relaxed` 模式。STE 是有偏梯度估计器。
 
 ### Gamma groups
 
@@ -114,4 +116,5 @@ python train.py \
 - 记录两个 Poisson group 的 mean rate、零比例、达到 `max_count` 的比例，以及四个 Gamma group 的 shape/rate 分位数。
 - 对比至少三个估计器：当前 straight-through、score-function + control variate、连续松弛。
 - 做消融：全 Gamma、低分辨率 Negative Binomial、高分辨率 Normal，以及每个输入 1/4/8 条随机路径。
-- 只有在截断比例接近零、梯度无 NaN、各 group 非塌缩后，再进行完整 NVAE 规模训练。
+- 只有在梯度无 NaN、各 group 非塌缩后，再进行完整 NVAE 规模训练。
+
