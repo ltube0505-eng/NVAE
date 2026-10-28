@@ -431,6 +431,10 @@ if __name__ == '__main__':
     parser.add_argument('--num_x_bits', type=int, default=8,
                         help='The number of bits used for representing data for colored images.')
     # latent variables
+    parser.add_argument('--scale_connection', type=str, default='feature',
+                        choices=['feature', 'last_sample'],
+                        help='cross-scale connection: original features or only the previous '
+                             'scale last sample, used for the next scale first group')
     parser.add_argument('--num_latent_scales', type=int, default=1,
                         help='the number of latent scales')
     parser.add_argument('--num_groups_per_scale', type=int, default=10,

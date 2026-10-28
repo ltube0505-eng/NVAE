@@ -265,7 +265,9 @@ def average_gradients(params, is_distributed):
     if is_distributed:
         size = float(dist.get_world_size())
         for param in params:
-            if param.requires_grad:
+            # A sample-only scale boundary intentionally discards the old
+            # terminal feature. Its feature-only parameters can have no grad.
+            if param.requires_grad and param.grad is not None:
                 dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM)
                 param.grad.data /= size
 
