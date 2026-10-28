@@ -157,6 +157,8 @@ class AutoEncoder(nn.Module):
         self.num_latent_per_group = args.num_latent_per_group   # number of latent vars. per group
         self.groups_per_scale = groups_per_scale(self.num_latent_scales, self.num_groups_per_scale, args.ada_groups,
                                                  minimum_groups=args.min_groups_per_scale)
+        self.separate_image_decoder = (self.scale_connection == 'last_sample' and
+                                       self.num_latent_scales > 1)
 
         if self.latent_distribution == 'mixed_poisson_gamma':
             if self.groups_per_scale != [4, 2]:
@@ -213,7 +215,15 @@ class AutoEncoder(nn.Module):
             self.dec_tower = []
             self.stem_decoder = Conv2D(self.num_latent_per_group, mult * self.num_channels_enc, (1, 1), bias=True)
         else:
+            decoder_mult = mult
             self.dec_tower, mult = self.init_decoder_tower(mult)
+            if self.separate_image_decoder:
+                # The latent-condition tower has sample-only scale boundaries.
+                # The likelihood tower independently combines EVERY group using
+                # the original feature-connected NVAE decoder architecture.
+                self.image_ftr0 = nn.Parameter(torch.rand(size=prior_ftr0_size))
+                self.image_dec_tower, _ = self.init_decoder_tower(
+                    decoder_mult, scale_connection='feature')
 
         self.post_process, mult = self.init_post_process(mult)
 
@@ -327,8 +337,9 @@ class AutoEncoder(nn.Module):
 
         return enc_sampler, dec_sampler, nf_cells, enc_kv, dec_kv, query
 
-    def init_decoder_tower(self, mult):
+    def init_decoder_tower(self, mult, scale_connection=None):
         # create decoder tower
+        scale_connection = self.scale_connection if scale_connection is None else scale_connection
         dec_tower = nn.ModuleList()
         for s in range(self.num_latent_scales):
             for g in range(self.groups_per_scale[self.num_latent_scales - s - 1]):
@@ -347,7 +358,7 @@ class AutoEncoder(nn.Module):
             if s < self.num_latent_scales - 1:
                 num_ci = int(self.num_channels_dec * mult)
                 num_co = int(num_ci / CHANNEL_MULT)
-                if self.scale_connection == 'last_sample':
+                if scale_connection == 'last_sample':
                     spatial_size = self.z0_size[1] * (2 ** (s + 1))
                     cell = ScaleBoundaryCell(num_co, self.num_latent_per_group, spatial_size)
                 else:
@@ -357,6 +368,24 @@ class AutoEncoder(nn.Module):
                 mult = mult / CHANNEL_MULT
 
         return dec_tower, mult
+
+    def _image_features_from_latents(self, latents):
+        """Build likelihood features from all actual samples in generation order.
+
+        This tower has independent weights and never supplies features to a
+        prior/posterior head. No x features or resampled/detached latents enter.
+        """
+        if len(latents) != sum(self.groups_per_scale):
+            raise ValueError('Image decoder requires one sample per latent group.')
+        s = self.image_ftr0.unsqueeze(0).expand(latents[0].size(0), -1, -1, -1)
+        index = 0
+        for cell in self.image_dec_tower:
+            if cell.cell_type == 'combiner_dec':
+                s = cell(s, latents[index])
+                index += 1
+            else:
+                s = cell(s)
+        return s
 
     def init_post_process(self, mult):
         post_process = nn.ModuleList()
@@ -521,6 +550,7 @@ class AutoEncoder(nn.Module):
             log_q_conv -= log_det
         nf_offset += self.num_flows
         all_q = [dist]
+        all_z = [z] if self.separate_image_decoder else None
         all_log_q = [log_q_conv]
         all_proposal_log_probs = []
         if proposal_log_probs is not None:
@@ -563,6 +593,8 @@ class AutoEncoder(nn.Module):
                         z, log_det = self.nf_cells[nf_offset + n](z, ftr)
                         log_q_conv -= log_det
                     nf_offset += self.num_flows
+                    if all_z is not None:
+                        all_z.append(z)
                     all_log_q.append(log_q_conv)
                     all_q.append(dist)
                     if proposal_log_probs is not None:
@@ -578,7 +610,7 @@ class AutoEncoder(nn.Module):
                 if scale_initial is not None:
                     # The bridge has served the first prior/posterior. Start
                     # within-scale propagation from the independent parameter
-                    # so the likelihood has no earlier-scale feature bypass.
+                    # so later latent conditionals have no bridge-feature bypass.
                     s = scale_initial
                     scale_initial = None
                 s = cell(s, z)
@@ -588,6 +620,8 @@ class AutoEncoder(nn.Module):
 
         if self.vanilla_vae:
             s = self.stem_decoder(z)
+        elif self.separate_image_decoder:
+            s = self._image_features_from_latents(all_z)
 
         for cell in self.post_process:
             s = cell(s)
@@ -628,6 +662,7 @@ class AutoEncoder(nn.Module):
         reference = torch.zeros(z0_size, device=self.prior_ftr0.device)
         dist = self._fixed_prior(0, reference, temp=t)
         z, _ = self._sample_latent(dist, training_sample=False)
+        all_z = [z] if self.separate_image_decoder else None
 
         idx_dec = 0
         s = self.prior_ftr0.unsqueeze(0)
@@ -643,6 +678,8 @@ class AutoEncoder(nn.Module):
                     param = self.dec_sampler[idx_dec - 1](s)
                     dist = self._latent_from_param(idx_dec, param, temp=t)
                     z, _ = self._sample_latent(dist, training_sample=False)
+                    if all_z is not None:
+                        all_z.append(z)
 
                 # 'combiner_dec'
                 if scale_initial is not None:
@@ -655,6 +692,8 @@ class AutoEncoder(nn.Module):
 
         if self.vanilla_vae:
             s = self.stem_decoder(z)
+        elif self.separate_image_decoder:
+            s = self._image_features_from_latents(all_z)
 
         for cell in self.post_process:
             s = cell(s)

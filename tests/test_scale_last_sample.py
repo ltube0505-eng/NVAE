@@ -35,7 +35,7 @@ def make_model(**overrides):
     return model
 
 
-def fixed_trajectory(model, changes=None, prior=False):
+def fixed_trajectory(model, changes=None, prior=False, x_value=0.):
     """Intervene on sampled values, leaving all real p/q heads in operation."""
     changes = changes or {}
     index = [0]
@@ -53,7 +53,8 @@ def fixed_trajectory(model, changes=None, prior=False):
     model._sample_latent = sample
     try:
         with torch.no_grad():
-            logits = model.sample(2, 1.) if prior else model(torch.zeros(2, 1, 32, 32))[0]
+            logits = model.sample(2, 1.) if prior else model(
+                torch.full((2, 1, 32, 32), x_value))[0]
     finally:
         model._sample_latent = original
         for handle in handles:
@@ -77,9 +78,9 @@ def test_bridge_uses_only_terminal_sample_and_only_for_first_group(prior):
     assert not torch.allclose(priors[1], terminal_priors[1])
     # Once the next first sample is fixed, no old-scale condition persists.
     assert torch.equal(priors[2], terminal_priors[2])
-    assert torch.equal(output, early_output)
-    assert torch.equal(output, terminal_output)
-    # The output still uses the last scale's groups.
+    # The independent image decoder intentionally sees ALL scales' samples.
+    assert not torch.allclose(output, early_output)
+    assert not torch.allclose(output, terminal_output)
     changed_output, _ = fixed_trajectory(model, {2: 3.}, prior=prior)
     assert not torch.allclose(output, changed_output)
 
@@ -98,9 +99,10 @@ def test_forward_and_generation_share_the_same_prior_and_likelihood():
     sampled_output, sampled_priors = fixed_trajectory(model, prior=True)
     assert torch.equal(output, sampled_output)
     assert all(torch.equal(p, s) for p, s in zip(priors, sampled_priors))
-    # All earlier scales can be changed when the final scale is fixed.
-    intervened, _ = fixed_trajectory(model, {0: 2., 1: 2., 2: 2., 3: 2.})
-    assert torch.equal(output, intervened)
+    # Every group changes the likelihood, with all other samples held fixed.
+    for group in range(6):
+        intervened, _ = fixed_trajectory(model, {group: 3.})
+        assert not torch.allclose(output, intervened)
 
 
 @pytest.mark.parametrize('config,total', [
@@ -163,16 +165,22 @@ def test_reconstruction_gradient_reaches_previous_scale_sample():
 
 def test_flow_boundary_receives_actual_post_flow_sample():
     model = make_model(num_nf=1).eval()
-    flow_samples, boundary_samples = [], []
-    handles = [model.nf_cells[1].register_forward_hook(
-        lambda module, inputs, output: flow_samples.append(output[0]))]
+    flow_samples, boundary_samples, image_samples = [], [], []
+    handles = [cell.register_forward_hook(
+        lambda module, inputs, output: flow_samples.append(output[0]))
+        for cell in model.nf_cells]
     handles += [m.register_forward_pre_hook(
         lambda module, inputs: boundary_samples.append(inputs[0]))
         for m in model.modules() if isinstance(m, ScaleBoundaryCell)]
+    handles += [cell.register_forward_pre_hook(
+        lambda module, inputs: image_samples.append(inputs[1]))
+        for cell in model.image_dec_tower if cell.cell_type == 'combiner_dec']
     try:
         with torch.no_grad():
             model(torch.rand(2, 1, 32, 32))
-        assert boundary_samples[0] is flow_samples[0]
+        assert boundary_samples[0] is flow_samples[1]
+        assert len(image_samples) == len(flow_samples) == 4
+        assert all(a is b for a, b in zip(image_samples, flow_samples))
     finally:
         for handle in handles:
             handle.remove()
@@ -229,6 +237,47 @@ def test_missing_flag_preserves_legacy_architecture(scales, groups):
 def test_invalid_connection_is_rejected():
     with pytest.raises(ValueError, match='Unknown scale connection'):
         make_model(scale_connection='typo')
+
+
+@pytest.mark.parametrize('adaptive', [False, True])
+def test_every_group_has_direct_reconstruction_gradient(adaptive):
+    torch.manual_seed(43)
+    model = make_model(num_latent_scales=3, num_groups_per_scale=4,
+                       ada_groups=adaptive).eval()
+    latents = []
+    for scale, groups in enumerate(reversed(model.groups_per_scale)):
+        size = model.z0_size[1] * 2 ** scale
+        latents.extend(torch.randn(2, model.num_latent_per_group, size, size,
+                                   requires_grad=True) for _ in range(groups))
+    s = model._image_features_from_latents(latents)
+    for cell in model.post_process:
+        s = cell(s)
+    model.image_conditional(s).square().mean().backward()
+    for z in latents:
+        assert z.grad is not None and torch.isfinite(z.grad).all()
+        assert z.grad.abs().sum() > 0
+    for p in model.image_dec_tower.parameters():
+        assert p.grad is not None and torch.isfinite(p.grad).all()
+    assert model.image_ftr0.grad is not None
+
+
+def test_image_tower_does_not_feed_back_into_latent_conditionals():
+    model = make_model().eval()
+    latent_ids = {id(p) for p in model.dec_tower.parameters()}
+    assert not latent_ids.intersection(id(p) for p in model.image_dec_tower.parameters())
+    output, priors = fixed_trajectory(model)
+    with torch.no_grad():
+        model.image_ftr0.add_(5.)
+    changed, changed_priors = fixed_trajectory(model)
+    assert not torch.allclose(output, changed)
+    assert all(torch.equal(a, b) for a, b in zip(priors, changed_priors))
+
+
+def test_image_decoder_has_no_deterministic_x_bypass():
+    model = make_model().eval()
+    a, _ = fixed_trajectory(model, x_value=0.)
+    b, _ = fixed_trajectory(model, x_value=1.)
+    assert torch.equal(a, b)
 
 
 def test_training_regularizer_and_gradient_average_allow_discarded_features():
