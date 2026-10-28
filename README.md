@@ -14,7 +14,20 @@ likelihood-based generative models on several image datasets.
     <img src="img/celebahq.png" width="800">
 </p>
 
+## Optional sample-only scale connections
+
+Use `--scale_connection last_sample` to connect each scale only through the previous
+scale's last sampled latent group. Each scale has its own randomly initialized,
+learnable initial feature map. The boundary sample conditions only the next scale's
+first prior/posterior; within-scale feature propagation then restarts independently,
+so the image likelihood depends directly only on the final scale's latent groups.
+All latent KL terms are retained. The default `--scale_connection feature` preserves
+the original architecture and old checkpoints.
+
+See [the detailed algorithm, training example and validation notes](docs/scale_last_sample_bridge.md).
+
 ## Requirements
+
 NVAE is built in Python 3.7 using PyTorch 1.6.0. Use the following command to install the requirements:
 ```
 pip install -r requirements.txt

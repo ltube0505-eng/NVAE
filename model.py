@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from neural_operations import OPS, EncCombinerCell, DecCombinerCell, Conv2D, get_skip_connection, SE
+from neural_operations import ScaleBoundaryCell
 from neural_ar_operations import ARConv2d, ARInvertedResidual, MixLogCDFParam, mix_log_cdf_flow
 from neural_ar_operations import ELUConv as ARELUConv
 from torch.distributions.bernoulli import Bernoulli
@@ -111,6 +112,9 @@ class AutoEncoder(nn.Module):
         self.use_se = args.use_se
         self.res_dist = args.res_dist
         self.num_bits = args.num_x_bits
+        self.scale_connection = getattr(args, 'scale_connection', 'feature')
+        if self.scale_connection not in {'feature', 'last_sample'}:
+            raise ValueError('Unknown scale connection: %s' % self.scale_connection)
         self.latent_distribution = getattr(args, 'latent_distribution', 'normal')
         self.poisson_relaxation_temperature = getattr(args, 'poisson_relaxation_temperature', 0.1)
         self.poisson_max_count = getattr(args, 'poisson_max_count', 64)
@@ -338,12 +342,17 @@ class AutoEncoder(nn.Module):
                 cell = DecCombinerCell(num_c, self.num_latent_per_group, num_c, cell_type='combiner_dec')
                 dec_tower.append(cell)
 
-            # down cells after finishing a scale
+            # Change resolution after finishing a scale. In last_sample mode
+            # the old decoder feature is discarded, not upsampled.
             if s < self.num_latent_scales - 1:
-                arch = self.arch_instance['up_dec']
                 num_ci = int(self.num_channels_dec * mult)
                 num_co = int(num_ci / CHANNEL_MULT)
-                cell = Cell(num_ci, num_co, cell_type='up_dec', arch=arch, use_se=self.use_se)
+                if self.scale_connection == 'last_sample':
+                    spatial_size = self.z0_size[1] * (2 ** (s + 1))
+                    cell = ScaleBoundaryCell(num_co, self.num_latent_per_group, spatial_size)
+                else:
+                    arch = self.arch_instance['up_dec']
+                    cell = Cell(num_ci, num_co, cell_type='up_dec', arch=arch, use_se=self.use_se)
                 dec_tower.append(cell)
                 mult = mult / CHANNEL_MULT
 
@@ -530,8 +539,13 @@ class AutoEncoder(nn.Module):
         s = self.prior_ftr0.unsqueeze(0)
         batch_size = z.size(0)
         s = s.expand(batch_size, -1, -1, -1)
+        scale_initial = None
         for cell in self.dec_tower:
-            if cell.cell_type == 'combiner_dec':
+            if cell.cell_type == 'scale_boundary':
+                # z is the previous scale's last (post-flow) sample. The old
+                # feature s is never an input to this boundary.
+                scale_initial, s = cell(z)
+            elif cell.cell_type == 'combiner_dec':
                 if idx_dec > 0:
                     # form prior
                     param = self.dec_sampler[idx_dec - 1](s)
@@ -561,6 +575,12 @@ class AutoEncoder(nn.Module):
                     all_log_p.append(log_p_conv)
 
                 # 'combiner_dec'
+                if scale_initial is not None:
+                    # The bridge has served the first prior/posterior. Start
+                    # within-scale propagation from the independent parameter
+                    # so the likelihood has no earlier-scale feature bypass.
+                    s = scale_initial
+                    scale_initial = None
                 s = cell(s, z)
                 idx_dec += 1
             else:
@@ -604,7 +624,6 @@ class AutoEncoder(nn.Module):
         return logits, log_q, log_p, kl_all, kl_diag
 
     def sample(self, num_samples, t):
-        scale_ind = 0
         z0_size = [num_samples] + self.z0_size
         reference = torch.zeros(z0_size, device=self.prior_ftr0.device)
         dist = self._fixed_prior(0, reference, temp=t)
@@ -614,8 +633,11 @@ class AutoEncoder(nn.Module):
         s = self.prior_ftr0.unsqueeze(0)
         batch_size = z.size(0)
         s = s.expand(batch_size, -1, -1, -1)
+        scale_initial = None
         for cell in self.dec_tower:
-            if cell.cell_type == 'combiner_dec':
+            if cell.cell_type == 'scale_boundary':
+                scale_initial, s = cell(z)
+            elif cell.cell_type == 'combiner_dec':
                 if idx_dec > 0:
                     # form prior
                     param = self.dec_sampler[idx_dec - 1](s)
@@ -623,12 +645,13 @@ class AutoEncoder(nn.Module):
                     z, _ = self._sample_latent(dist, training_sample=False)
 
                 # 'combiner_dec'
+                if scale_initial is not None:
+                    s = scale_initial
+                    scale_initial = None
                 s = cell(s, z)
                 idx_dec += 1
             else:
                 s = cell(s)
-                if cell.cell_type == 'up_dec':
-                    scale_ind += 1
 
         if self.vanilla_vae:
             s = self.stem_decoder(z)

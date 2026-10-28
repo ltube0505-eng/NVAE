@@ -265,6 +265,30 @@ class DecCombinerCell(nn.Module):
         return out
 
 
+class ScaleBoundaryCell(nn.Module):
+    """Condition a new scale on only the previous scale's last sample.
+
+    The condition is used for the new scale's first latent distribution only.
+    After sampling that group, the caller must resume from ``initial_feature``
+    (the first return value), not from the sample-dependent condition.
+    """
+
+    def __init__(self, num_channels, num_latent, spatial_size):
+        super(ScaleBoundaryCell, self).__init__()
+        self.cell_type = 'scale_boundary'
+        self.initial_feature = nn.Parameter(torch.rand(
+            num_channels, spatial_size, spatial_size))
+        self.combiner = DecCombinerCell(
+            num_channels, num_latent, num_channels, cell_type='bridge_combiner')
+
+    def forward(self, last_sample):
+        initial = self.initial_feature.unsqueeze(0).expand(
+            last_sample.size(0), -1, -1, -1)
+        sample = F.interpolate(last_sample, size=initial.shape[2:], mode='nearest')
+        condition = self.combiner(initial, sample)
+        return initial, condition
+
+
 class ConvBNSwish(nn.Module):
     def __init__(self, Cin, Cout, k=3, stride=1, groups=1, dilation=1):
         padding = dilation * (k - 1) // 2
