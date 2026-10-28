@@ -70,3 +70,6 @@ OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python -m pytest -q tests
 
 测试覆盖精确整数前向、无 count 截断、STE 的加权向量梯度、所有后验/先验分布、
 仅重建损失到所有后验头的梯度、跨尺度边界梯度、评估/生成路径及原有架构回归测试。
+
+五个逻辑 scale、分组 `[3,2,4,4,2]`、尺寸 `[4,4,8,8,8]` 的完整参考实验配置见
+[五尺度 MNIST 训练命令](mnist_five_scales_poisson_ste.md)。

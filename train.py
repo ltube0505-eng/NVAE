@@ -47,7 +47,9 @@ def main(args):
 
     logging.info('args = %s', args)
     logging.info('param size = %fM ', utils.count_parameters_in_M(model))
-    logging.info('groups per scale: %s, total_groups: %d', model.groups_per_scale, sum(model.groups_per_scale))
+    logging.info('groups per scale (encoder order): %s, total_groups: %d', model.groups_per_scale, sum(model.groups_per_scale))
+    logging.info('latent scales (generation order): groups=%s, sizes=%s',
+                 list(reversed(model.groups_per_scale)), model.latent_scale_sizes)
 
     if args.fast_adamax:
         # Fast adamax has the same functionality as torch.optim.Adamax, except it is faster.
@@ -439,6 +441,12 @@ if __name__ == '__main__':
                         help='the number of latent scales')
     parser.add_argument('--num_groups_per_scale', type=int, default=10,
                         help='number of groups of latent variables per scale')
+    parser.add_argument('--latent_scale_groups', type=str, default=None,
+                        help='explicit groups per logical scale in generation order, e.g. 3,2,4,4,2; '
+                             'overrides num_groups_per_scale and ada_groups')
+    parser.add_argument('--latent_scale_sizes', type=str, default=None,
+                        help='square latent sizes in generation order, e.g. 4,4,8,8,8; '
+                             'adjacent sizes may stay equal or double')
     parser.add_argument('--num_latent_per_group', type=int, default=20,
                         help='number of channels in latent variables per group')
     parser.add_argument('--latent_distribution', type=str, default='poisson',

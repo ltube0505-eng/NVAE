@@ -24,6 +24,16 @@ from thirdparty.inplaced_sync_batchnorm import SyncBatchNormSwish
 CHANNEL_MULT = 2
 
 
+def _positive_int_list(value, name):
+    try:
+        values = [int(v.strip()) for v in value.split(',')] if isinstance(value, str) else list(value)
+    except (ValueError, TypeError):
+        raise ValueError('%s must be a comma-separated list of positive integers.' % name)
+    if not values or any(not isinstance(v, int) or v < 1 for v in values):
+        raise ValueError('%s must contain positive integers.' % name)
+    return values
+
+
 class Cell(nn.Module):
     def __init__(self, Cin, Cout, cell_type, arch, use_se):
         super(Cell, self).__init__()
@@ -157,6 +167,13 @@ class AutoEncoder(nn.Module):
         self.num_latent_per_group = args.num_latent_per_group   # number of latent vars. per group
         self.groups_per_scale = groups_per_scale(self.num_latent_scales, self.num_groups_per_scale, args.ada_groups,
                                                  minimum_groups=args.min_groups_per_scale)
+        explicit_groups = getattr(args, 'latent_scale_groups', None)
+        if explicit_groups is not None:
+            generation_groups = _positive_int_list(explicit_groups, 'latent_scale_groups')
+            if len(generation_groups) != self.num_latent_scales:
+                raise ValueError('latent_scale_groups length must equal num_latent_scales.')
+            # Public schedules use generation order; internal groups use encoder order.
+            self.groups_per_scale = list(reversed(generation_groups))
         self.separate_image_decoder = (self.scale_connection == 'last_sample' and
                                        self.num_latent_scales > 1)
 
@@ -165,7 +182,7 @@ class AutoEncoder(nn.Module):
                 raise ValueError('mixed_poisson_gamma requires two scales with encoder groups [4, 2]. '
                                  'Use --num_latent_scales 2 --num_groups_per_scale 4 --ada_groups '
                                  '--min_groups_per_scale 2.')
-        self.vanilla_vae = self.num_latent_scales == 1 and self.num_groups_per_scale == 1
+        self.vanilla_vae = self.num_latent_scales == 1 and self.groups_per_scale == [1]
 
         # encoder parameteres
         self.num_channels_enc = args.num_channels_enc
@@ -182,13 +199,30 @@ class AutoEncoder(nn.Module):
 
         # general cell parameters
         self.input_size = get_input_size(self.dataset)
+        largest_size = self.input_size // (2 ** self.num_preprocess_blocks)
+        explicit_sizes = getattr(args, 'latent_scale_sizes', None)
+        if explicit_sizes is None:
+            self.latent_scale_sizes = [largest_size // (2 ** i)
+                                       for i in reversed(range(self.num_latent_scales))]
+        else:
+            self.latent_scale_sizes = _positive_int_list(explicit_sizes, 'latent_scale_sizes')
+        if len(self.latent_scale_sizes) != self.num_latent_scales:
+            raise ValueError('latent_scale_sizes length must equal num_latent_scales.')
+        if self.latent_scale_sizes[0] < 1 or self.latent_scale_sizes[-1] != largest_size:
+            raise ValueError('latent_scale_sizes must end at the preprocessed input size (%d).'
+                             % largest_size)
+        if any(b not in (a, 2 * a) for a, b in
+               zip(self.latent_scale_sizes, self.latent_scale_sizes[1:])):
+            raise ValueError('Adjacent latent_scale_sizes must stay equal or double in generation order.')
 
         # decoder param
         self.num_mix_output = args.num_mixture_dec
 
         # used for generative purpose
-        c_scaling = CHANNEL_MULT ** (self.num_preprocess_blocks + self.num_latent_scales - 1)
-        spatial_scaling = 2 ** (self.num_preprocess_blocks + self.num_latent_scales - 1)
+        resolution_steps = sum(b > a for a, b in
+                               zip(self.latent_scale_sizes, self.latent_scale_sizes[1:]))
+        c_scaling = CHANNEL_MULT ** (self.num_preprocess_blocks + resolution_steps)
+        spatial_scaling = 2 ** (self.num_preprocess_blocks + resolution_steps)
         prior_ftr0_size = (int(c_scaling * self.num_channels_dec), self.input_size // spatial_scaling,
                            self.input_size // spatial_scaling)
         self.prior_ftr0 = nn.Parameter(torch.rand(size=prior_ftr0_size), requires_grad=True)
@@ -292,7 +326,8 @@ class AutoEncoder(nn.Module):
                     enc_tower.append(cell)
 
             # down cells after finishing a scale
-            if s < self.num_latent_scales - 1:
+            encoder_sizes = list(reversed(self.latent_scale_sizes))
+            if s < self.num_latent_scales - 1 and encoder_sizes[s + 1] < encoder_sizes[s]:
                 arch = self.arch_instance['down_enc']
                 num_ci = int(self.num_channels_enc * mult)
                 num_co = int(CHANNEL_MULT * num_ci)
@@ -333,7 +368,8 @@ class AutoEncoder(nn.Module):
                         Conv2D(num_c, 2 * self.num_latent_per_group, kernel_size=1, padding=0, bias=True))
                     dec_sampler.append(cell)
 
-            mult = mult / CHANNEL_MULT
+            if s < self.num_latent_scales - 1:
+                mult *= self.latent_scale_sizes[s] / self.latent_scale_sizes[s + 1]
 
         return enc_sampler, dec_sampler, nf_cells, enc_kv, dec_kv, query
 
@@ -353,19 +389,21 @@ class AutoEncoder(nn.Module):
                 cell = DecCombinerCell(num_c, self.num_latent_per_group, num_c, cell_type='combiner_dec')
                 dec_tower.append(cell)
 
-            # Change resolution after finishing a scale. In last_sample mode
-            # the old decoder feature is discarded, not upsampled.
+            # A logical scale boundary may keep its resolution. Sample-only
+            # conditioning still restarts from an independent initial feature.
             if s < self.num_latent_scales - 1:
+                ratio = self.latent_scale_sizes[s + 1] / self.latent_scale_sizes[s]
                 num_ci = int(self.num_channels_dec * mult)
-                num_co = int(num_ci / CHANNEL_MULT)
+                num_co = int(num_ci / ratio)
                 if scale_connection == 'last_sample':
-                    spatial_size = self.z0_size[1] * (2 ** (s + 1))
-                    cell = ScaleBoundaryCell(num_co, self.num_latent_per_group, spatial_size)
-                else:
+                    cell = ScaleBoundaryCell(num_co, self.num_latent_per_group,
+                                             self.latent_scale_sizes[s + 1])
+                    dec_tower.append(cell)
+                elif ratio == 2:
                     arch = self.arch_instance['up_dec']
                     cell = Cell(num_ci, num_co, cell_type='up_dec', arch=arch, use_se=self.use_se)
-                dec_tower.append(cell)
-                mult = mult / CHANNEL_MULT
+                    dec_tower.append(cell)
+                mult = mult / ratio
 
         return dec_tower, mult
 
@@ -758,3 +796,4 @@ class AutoEncoder(nn.Module):
                 loss += torch.max(torch.abs(l.weight))
 
         return loss
+
