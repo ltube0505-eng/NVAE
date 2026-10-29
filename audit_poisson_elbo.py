@@ -7,6 +7,7 @@ from unittest import mock
 import torch
 
 from distributions import Poisson
+from check_poisson_rng import Sampler
 import utils
 
 
@@ -15,8 +16,11 @@ def reduce_vars(tensor):
 
 
 class PoissonAudit:
-    def __init__(self, sampler='native'):
+    def __init__(self, sampler='native', seed=1):
+        if sampler not in {'native', 'cpu', 'fresh'}:
+            raise ValueError('Unknown audit sampler: %s' % sampler)
         self.sampler = sampler
+        self.backend_sampler = Sampler(sampler, seed)
         self.reset()
 
     def reset(self):
@@ -58,10 +62,10 @@ class PoissonAudit:
             return value
 
         def sample(dist, *args, **kwargs):
-            if audit.sampler == 'cpu':
+            if audit.sampler in {'cpu', 'fresh'}:
                 if kwargs.get('estimator') != 'exact':
-                    raise RuntimeError('CPU comparison requires eval exact sampling.')
-                return torch.poisson(dist.rate.detach().cpu()).to(dist.rate.device), None
+                    raise RuntimeError('CPU/fresh comparison requires eval exact sampling.')
+                return audit.backend_sampler(dist.rate.detach()), None
             return original_sample(dist, *args, **kwargs)
 
         self.patches = [mock.patch.object(Poisson, 'log_p', log_p),
@@ -132,7 +136,7 @@ def run(options):
     model = model.to(options.device).eval()
     _, loader, _ = datasets.get_loaders(args)
     totals, group_totals, count, images, nll_sum = None, None, 0, 0, 0.
-    with PoissonAudit(options.sampler) as audit:
+    with PoissonAudit(options.sampler, seed=options.seed) as audit:
         for batch_index, batch in enumerate(loader):
             if options.max_batches and batch_index >= options.max_batches:
                 break
@@ -157,7 +161,7 @@ def run(options):
         rows.append(r)
     variance = group_totals[:, keys.index('residual_variance')].sum().item()
     report = {'torch': torch.__version__, 'cuda_runtime': torch.version.cuda,
-              'device': options.device, 'sampler': options.sampler,
+              'device': options.device, 'sampler': options.sampler, 'seed': options.seed,
               'checkpoint_epoch': checkpoint.get('epoch'), 'images': images,
               'samples_per_image': options.samples, 'recon': recon,
               'analytic_nelbo': recon + kl, 'mc_nelbo': recon + mc,
@@ -179,7 +183,7 @@ if __name__ == '__main__':
     parser.add_argument('--samples', type=int, default=20)
     parser.add_argument('--max-batches', type=int, default=10, help='0: entire validation set')
     parser.add_argument('--device', default='cuda:0')
-    parser.add_argument('--sampler', choices=['native', 'cpu'], default='native')
+    parser.add_argument('--sampler', choices=['native', 'cpu', 'fresh'], default='native')
     parser.add_argument('--seed', type=int, default=1)
     options = parser.parse_args()
     if options.samples < 1 or options.batch_size < 1 or options.max_batches < 0:

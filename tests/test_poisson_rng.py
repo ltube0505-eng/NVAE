@@ -53,7 +53,7 @@ def test_correlation_probe_detects_repeated_calls():
 
 def test_report_preserves_unsupported_backend_error(tmp_path):
     options = SimpleNamespace(device='cpu', backends='fresh,cpu', seeds=[1], sizes=[1],
-                              batch_size=2, rates=[1.], calls=2, dtype=torch.float32,
+                              batch_size=2, rates=[1.], prefix_rates=[10.], calls=2, dtype=torch.float32,
                               out=str(tmp_path / 'rng.json'))
     original = probe.Sampler
 
@@ -67,3 +67,21 @@ def test_report_preserves_unsupported_backend_error(tmp_path):
     assert report['errors'] == [{'backend': 'fresh', 'error': 'unsupported CUDA generator'}]
     assert len(report['results']) == 2
     assert (tmp_path / 'rng.json').is_file()
+
+
+def test_conditional_probe_detects_reused_prefix_counts():
+    class Reused:
+        def __init__(self, *args):
+            self.prefix = None
+        def __call__(self, rate):
+            if self.prefix is None:
+                self.prefix = torch.poisson(rate)
+                return self.prefix
+            z = self.prefix.clone()
+            self.prefix = None
+            return z
+    with mock.patch.object(probe, 'Sampler', Reused):
+        row = probe.conditional_probe('native', 'cpu', (8, 20, 4, 4), 4, 7,
+                                      torch.float32, prefix_rate_value=28.)
+    assert row['prefix_rate'] == 28.
+    assert abs(row['iid_z_score']) > 20

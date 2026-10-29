@@ -8,7 +8,7 @@ from distributions import Poisson
 from test_explicit_scales import scheduled_model
 
 
-@pytest.mark.parametrize('sampler', ['native', 'cpu'])
+@pytest.mark.parametrize('sampler', ['native', 'cpu', 'fresh'])
 def test_audit_reconciles_every_group_and_jensen(sampler):
     torch.manual_seed(113)
     model = scheduled_model().eval()
@@ -77,3 +77,17 @@ def test_checkpoint_cli_workflow(tmp_path):
                      report['total_log_ratio_numeric_error'] -
                      report['total_kl_numeric_error'])
     assert abs(report['mc_minus_analytic'] - decomposition) < 1e-8
+
+
+def test_fresh_audit_seed_is_reproducible_and_not_reset_per_forward():
+    def trajectory():
+        with PoissonAudit('fresh', seed=7) as audit:
+            q = Poisson(torch.full((2, 20, 4, 4), 1.))
+            first = q.sample(estimator='exact')[0]
+            audit.reset()
+            second = q.sample(estimator='exact')[0]
+        return first, second
+    a, b = trajectory()
+    c, d = trajectory()
+    assert torch.equal(a, c) and torch.equal(b, d)
+    assert not torch.equal(a, b)

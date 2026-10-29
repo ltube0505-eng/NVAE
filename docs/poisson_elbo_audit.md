@@ -46,3 +46,10 @@ python audit_poisson_elbo.py \
 以及运行设备/版本；若仅 GPU native 模式持续偏离而 CPU 抽样模式不偏离，可进一步隔离 GPU
 随机抽样路径，但一次 CPU 对照仍不足以认定框架存在缺陷。若数值误差解释了差异，再定位
 对应组的 KL、log-PMF 或总和精度。不要通过调整日志名字或用 MC-NELBO 替换解析值来掩盖异常。
+
+## fresh 随机流对照
+
+新增 `--sampler fresh`：网络仍在 GPU，每次 Poisson 调用使用独立新 seed 的设备生成器，
+seed 从单独的 CPU 随机源按 `--seed` 可重复地产生。此路径与 check_poisson_rng.py 的
+fresh 模式一致。输出包含 seed。应先固定一份 checkpoint 快照，再在同一快照上对比
+cpu/fresh；检查 MC-minus-analytic 是否接近零，而不是要求两次随机抽样的指标逐位相同。

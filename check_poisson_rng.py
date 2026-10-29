@@ -108,10 +108,10 @@ def marginal_probe(backend, device, shape, rate, calls, seed, dtype):
             'call_means': call_means}
 
 
-def conditional_probe(backend, device, shape, calls, seed, dtype, upsample=False):
+def conditional_probe(backend, device, shape, calls, seed, dtype, upsample=False, prefix_rate_value=10.):
     seed_all(seed)
     sample = Sampler(backend, seed)
-    prefix_rate = torch.full(shape, 10., device=device, dtype=dtype)
+    prefix_rate = torch.full(shape, prefix_rate_value, device=device, dtype=dtype)
     residual_sum = variance_sum = count_sum = rate_sum = nimages = 0.
     block_means = []
     for _ in range(calls):
@@ -119,7 +119,7 @@ def conditional_probe(backend, device, shape, calls, seed, dtype, upsample=False
         if upsample:
             prefix = prefix.repeat_interleave(2, dim=2).repeat_interleave(2, dim=3)
         # Later rate is a deterministic function of an earlier random sample.
-        qrate = torch.where(prefix > 10., torch.full_like(prefix, 28.),
+        qrate = torch.where(prefix > prefix_rate_value, torch.full_like(prefix, 28.),
                             torch.full_like(prefix, 0.1))
         z = sample(qrate)
         q, z = qrate.detach().cpu().double(), z.detach().cpu().double()
@@ -138,7 +138,8 @@ def conditional_probe(backend, device, shape, calls, seed, dtype, upsample=False
     blocks = torch.tensor(block_means, dtype=torch.float64)
     block_se = blocks.std(unbiased=True).item() / math.sqrt(calls)
     return {'kind': 'conditional', 'backend': backend, 'seed': seed,
-            'prefix_shape': list(shape), 'upsample': upsample, 'dtype': str(dtype),
+            'prefix_shape': list(shape), 'prefix_rate': prefix_rate_value,
+            'upsample': upsample, 'dtype': str(dtype),
             'images': int(nimages), 'weighted_residual_mean': mean,
             'conditional_iid_se': iid_se, 'iid_z_score': mean / iid_se if iid_se else None,
             'call_block_se': block_se, 'call_block_means': block_means,
@@ -169,14 +170,16 @@ def execute(options):
                               'Fano=%.5f call_corr=%s' %
                               (backend, seed, size, rate, row['mean'], row['fano'],
                                row['across_calls']['pearson']), flush=True)
-                    for upsample in ([False, True] if size == 4 else [False]):
-                        row = conditional_probe(backend, device, shape, options.calls,
-                                                seed, options.dtype, upsample)
-                        report['results'].append(row)
-                        print('conditional backend=%s seed=%d H=%d up=%s residual=%.5f '
-                              'iid_se=%.5f block_se=%.5f' %
-                              (backend, seed, size, upsample, row['weighted_residual_mean'],
-                               row['conditional_iid_se'], row['call_block_se']), flush=True)
+                    for prefix_rate in options.prefix_rates:
+                        for upsample in ([False, True] if size == 4 else [False]):
+                            row = conditional_probe(backend, device, shape, options.calls,
+                                                    seed, options.dtype, upsample, prefix_rate)
+                            report['results'].append(row)
+                            print('conditional backend=%s seed=%d H=%d prefix_rate=%g up=%s '
+                                  'residual=%.5f iid_se=%.5f block_se=%.5f' %
+                                  (backend, seed, size, prefix_rate, upsample,
+                                   row['weighted_residual_mean'], row['conditional_iid_se'],
+                                   row['call_block_se']), flush=True)
         except (RuntimeError, TypeError) as error:
             # Fresh CUDA generators might not be supported by an old build.
             # Preserve partial results and make that explicit, without fallback.
@@ -197,6 +200,8 @@ if __name__ == '__main__':
     parser.add_argument('--seeds', default='1,2,3')
     parser.add_argument('--rates', default='0.01,1,3,10,28,30')
     parser.add_argument('--sizes', default='4,8')
+    parser.add_argument('--prefix-rates', default='10,28',
+                        help='rates of preceding groups in conditional probes')
     parser.add_argument('--backends', default='native,cpu,fresh')
     parser.add_argument('--dtype', choices=['float32', 'float64'], default='float32')
     parser.add_argument('--out', required=True)
@@ -204,9 +209,11 @@ if __name__ == '__main__':
     options.seeds = [int(v) for v in options.seeds.split(',')]
     options.rates = [float(v) for v in options.rates.split(',')]
     options.sizes = [int(v) for v in options.sizes.split(',')]
+    options.prefix_rates = [float(v) for v in options.prefix_rates.split(',')]
     options.dtype = getattr(torch, options.dtype)
     if options.calls < 2 or options.batch_size < 2 or not options.seeds or not options.rates \
-            or not options.sizes or any(v <= 0 or not math.isfinite(v) for v in options.rates) \
+            or not options.sizes or not options.prefix_rates \
+            or any(v <= 0 or not math.isfinite(v) for v in options.rates + options.prefix_rates) \
             or any(v < 1 for v in options.sizes) \
             or any(v not in ('native', 'cpu', 'fresh') for v in options.backends.split(',')):
         parser.error('Use calls/batch-size >= 2, positive finite rates/sizes, valid backends and nonempty lists.')
