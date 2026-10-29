@@ -35,7 +35,11 @@ def set_bn(model, bn_eval_mode, num_samples=1, t=1.0, iter=100):
 
 
 def main(eval_args):
-    # ensures that weight initializations are all the same
+    # Seed both the network initialization and the independent Poisson stream.
+    evaluation_seed = eval_args.seed + eval_args.local_rank
+    torch.manual_seed(evaluation_seed)
+    np.random.seed(evaluation_seed)
+    torch.cuda.manual_seed_all(evaluation_seed)
     logging = utils.Logger(eval_args.local_rank, eval_args.save)
 
     # load a checkpoint
@@ -43,6 +47,12 @@ def main(eval_args):
     logging.info(eval_args.checkpoint)
     checkpoint = torch.load(eval_args.checkpoint, map_location='cpu')
     args = checkpoint['args']
+    if eval_args.poisson_sampling_backend is not None:
+        args.poisson_sampling_backend = eval_args.poisson_sampling_backend
+    elif not hasattr(args, 'poisson_sampling_backend'):
+        args.poisson_sampling_backend = 'fresh'
+    args.poisson_sampling_seed = eval_args.seed
+    args.global_rank = eval_args.local_rank
 
     if not hasattr(args, 'ada_groups'):
         logging.info('old model, no ada groups was found.')
@@ -145,6 +155,8 @@ if __name__ == '__main__':
                         help='Settings this to true will evaluate the model on training data.')
     parser.add_argument('--data', type=str, default='/tmp/data',
                         help='location of the data corpus')
+    parser.add_argument('--poisson_sampling_backend', choices=['fresh', 'cpu', 'native'],
+                        default=None, help='override checkpoint sampler; old checkpoints use fresh')
     parser.add_argument('--readjust_bn', action='store_true', default=False,
                         help='adding this flag will enable readjusting BN statistics.')
     parser.add_argument('--temp', type=float, default=0.7,

@@ -61,6 +61,7 @@ def test_requested_shapes_training_gradients_generation_and_restore():
     assert generated.shape == x.shape and torch.isfinite(generated).all()
     restored = scheduled_model().eval()
     restored.load_state_dict(model.state_dict(), strict=True)
+    restored.poisson_sampler.set_state(model.poisson_sampler.get_state())
     torch.manual_seed(97)
     with torch.no_grad():
         a = model(x)[0]

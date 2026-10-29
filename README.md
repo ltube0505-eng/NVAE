@@ -20,7 +20,11 @@ New training defaults to `--latent_distribution poisson
 --poisson_gradient_estimator straight_through --scale_connection last_sample`.
 Every latent prior and posterior is Poisson. During training, each sample is an
 exact Poisson integer with the rate-identity straight-through gradient:
-`z = torch.poisson(rate.detach()) + (rate - rate.detach())`.
+`hard = sampler(rate); z = hard + (rate - rate.detach())`.
+The default `--poisson_sampling_backend fresh` gives each Poisson call a separately
+seeded device generator to avoid the high-rate cross-call dependence observed in
+the legacy CUDA runtime. The CPU sampler remains available for comparison.
+See [the sampling fix and checkpoint instructions](docs/poisson_sampling_fix.md).
 Evaluation and prior generation use exact Poisson sampling too. Keep `--num_nf 0`.
 See [the branch guide and training command](docs/scale_last_sample_poisson_ste.md).
 

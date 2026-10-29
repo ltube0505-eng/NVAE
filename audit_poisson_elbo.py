@@ -7,7 +7,7 @@ from unittest import mock
 import torch
 
 from distributions import Poisson
-from check_poisson_rng import Sampler
+from poisson_sampling import PoissonSampler
 import utils
 
 
@@ -20,7 +20,7 @@ class PoissonAudit:
         if sampler not in {'native', 'cpu', 'fresh'}:
             raise ValueError('Unknown audit sampler: %s' % sampler)
         self.sampler = sampler
-        self.backend_sampler = Sampler(sampler, seed)
+        self.backend_sampler = PoissonSampler(sampler, seed)
         self.reset()
 
     def reset(self):
@@ -31,7 +31,6 @@ class PoissonAudit:
         audit = self
         original_log = Poisson.log_p
         original_kl = Poisson.kl
-        original_sample = Poisson.sample
 
         def log_p(dist, z):
             value = original_log(dist, z)
@@ -62,11 +61,9 @@ class PoissonAudit:
             return value
 
         def sample(dist, *args, **kwargs):
-            if audit.sampler in {'cpu', 'fresh'}:
-                if kwargs.get('estimator') != 'exact':
-                    raise RuntimeError('CPU/fresh comparison requires eval exact sampling.')
-                return audit.backend_sampler(dist.rate.detach()), None
-            return original_sample(dist, *args, **kwargs)
+            if kwargs.get('estimator') != 'exact':
+                raise RuntimeError('Poisson audit requires eval exact sampling.')
+            return audit.backend_sampler(dist.rate), None
 
         self.patches = [mock.patch.object(Poisson, 'log_p', log_p),
                         mock.patch.object(Poisson, 'kl', kl),

@@ -11,6 +11,7 @@ import torch.nn.functional as F
 import numpy as np
 
 from utils import one_hot
+from poisson_sampling import PoissonSampler
 
 @torch.jit.script
 def soft_clamp5(x: torch.Tensor):
@@ -65,7 +66,7 @@ class Poisson:
     binomial observation model.
     """
 
-    def __init__(self, log_rate, relaxation_temperature=0.1, max_count=64, max_rate=30.):
+    def __init__(self, log_rate, relaxation_temperature=0.1, max_count=64, max_rate=30., sampler=None):
         if relaxation_temperature <= 0.:
             raise ValueError('relaxation_temperature must be positive.')
         if max_count < 1:
@@ -79,6 +80,7 @@ class Poisson:
         self.log_rate = torch.log(self.rate)
         self.relaxation_temperature = relaxation_temperature
         self.max_count = max_count
+        self.sampler = sampler if sampler is not None else PoissonSampler()
 
     def _arrival_counts(self):
         """Return hard and relaxed counts built from the same arrivals."""
@@ -104,15 +106,15 @@ class Poisson:
             estimator = 'straight_through' if relaxed else 'exact'
 
         if estimator in {'exact', 'reinforce'}:
-            return torch.poisson(self.rate), None
+            return self.sampler(self.rate), None
 
         if estimator == 'obbvi':
             if proposal_tau is None:
                 raise ValueError('proposal_tau is required for O-BBVI sampling.')
-            return torch.poisson(self.proposal_rate(proposal_tau)), None
+            return self.sampler(self.proposal_rate(proposal_tau)), None
 
         if estimator == 'straight_through':
-            hard_count = torch.poisson(self.rate.detach())
+            hard_count = self.sampler(self.rate)
             # Exact integer forward values; identity surrogate with respect to
             # rate, followed by the usual chain rule through its parameterization.
             count = hard_count + (self.rate - self.rate.detach())

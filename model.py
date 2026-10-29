@@ -19,6 +19,7 @@ from torch.distributions.bernoulli import Bernoulli
 
 from utils import get_stride_for_cell_type, get_input_size, groups_per_scale
 from distributions import Normal, Poisson, Gamma, DiscMixLogistic, NormalDecoder
+from poisson_sampling import PoissonSampler
 from thirdparty.inplaced_sync_batchnorm import SyncBatchNormSwish
 
 CHANNEL_MULT = 2
@@ -129,6 +130,12 @@ class AutoEncoder(nn.Module):
         self.poisson_relaxation_temperature = getattr(args, 'poisson_relaxation_temperature', 0.1)
         self.poisson_max_count = getattr(args, 'poisson_max_count', 64)
         self.poisson_max_rate = getattr(args, 'poisson_max_rate', 30.)
+        self.poisson_sampling_backend = getattr(args, 'poisson_sampling_backend', 'fresh')
+        sampler_seed = int(getattr(args, 'poisson_sampling_seed', getattr(args, 'seed', 1)))
+        sampler_rank = int(getattr(args, 'global_rank', 0))
+        self.poisson_sampler = PoissonSampler(self.poisson_sampling_backend,
+                                              seed=sampler_seed + 1000003 * sampler_rank)
+
         self.poisson_gradient_estimator = getattr(
             args, 'poisson_gradient_estimator', 'straight_through')
         valid_estimators = {'relaxed', 'reinforce', 'obbvi', 'straight_through'}
@@ -478,7 +485,8 @@ class AutoEncoder(nn.Module):
             return Poisson(first,
                            relaxation_temperature=self.poisson_relaxation_temperature,
                            max_count=self.poisson_max_count,
-                           max_rate=self.poisson_max_rate)
+                           max_rate=self.poisson_max_rate,
+                           sampler=self.poisson_sampler)
         return Gamma(first, second, temp=temp)
 
     def _fixed_prior(self, group_index, reference, temp=1.):
@@ -490,7 +498,8 @@ class AutoEncoder(nn.Module):
             return Poisson(zeros,
                            relaxation_temperature=self.poisson_relaxation_temperature,
                            max_count=self.poisson_max_count,
-                           max_rate=self.poisson_max_rate)
+                           max_rate=self.poisson_max_rate,
+                           sampler=self.poisson_sampler)
         return Gamma(zeros, zeros, temp=temp)
 
     def set_obbvi_component(self, component):

@@ -8,7 +8,7 @@ Poisson；第一组先验为 Poisson(1)，后续组先验的 rate 由条件网�
 ## 前向和反向
 
 ```python
-hard = torch.poisson(rate.detach())
+hard = sampler(rate)  # 默认 fresh：每次调用独立的新设备 generator
 z = hard + (rate - rate.detach())
 ```
 
@@ -19,7 +19,7 @@ STE 是有偏代理梯度。它替换了父分支使用截断 hard-arrival count
 
 `poisson_max_count` 和 `poisson_relaxation_temperature` 不参与 STE；它们只用于
 显式选择的 `relaxed` 模式。`poisson_max_rate` 仍限制分布 rate，但样本可以超过 64。
-验证、先验生成和生成式 BN 重校准均使用精确 `torch.poisson` 采样。
+验证、先验生成和生成式 BN 重校准均经过共用 sampler 精确抽样，默认 fresh 后端。
 Poisson 的采样温度 `t` 沿用原实现，不改变 latent rate；比较此模型时使用 `t=1`。
 
 每组保留解析 Poisson KL：`rate_q * (log_rate_q - log_rate_p) + rate_p - rate_q`。
@@ -57,8 +57,8 @@ python train.py \
 请使用新的实验目录从头训练；Gaussian/Gamma checkpoint 不能当作训练好的 Poisson 模型。
 继续训练时需保持完整模型配置一致。`evaluate.py` 从 checkpoint args 恢复模型配置。
 为兼容历史 checkpoint，缺少分布/连接字段的 args 在模型构造器中仍按 Normal/feature 解释；
-新训练 parser 会保存本分支的显式默认值。历史 Poisson checkpoint 的评估采样行为不变，
-但在本分支以 `straight_through` 续训将改用 rate-STE。
+新训练 parser 会保存本分支的显式默认值。历史 Poisson checkpoint 缺少后端字段时也改用 fresh，评估随机行为随之变化；
+显式 native 仅用于旧行为诊断。在本分支以 `straight_through` 续训使用 rate-STE。
 
 显式设置旧分布或梯度估计选项仍可用于对照实验；本分支的新训练默认配置为全 Poisson + STE。
 
@@ -73,3 +73,5 @@ OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python -m pytest -q tests
 
 五个逻辑 scale、分组 `[3,2,4,4,2]`、尺寸 `[4,4,8,8,8]` 的完整参考实验配置见
 [五尺度 MNIST 训练命令](mnist_five_scales_poisson_ste.md)。
+
+抽样默认使用 fresh 隔离每次调用的随机流；详见[修正说明](poisson_sampling_fix.md)。

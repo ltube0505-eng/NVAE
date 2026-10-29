@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from distributions import Poisson
+from poisson_sampling import PoissonSampler
 from neural_operations import ScaleBoundaryCell
 from test_scale_last_sample import make_model
 
@@ -34,13 +35,14 @@ def test_new_training_defaults_select_all_poisson_ste_bridge():
     args = training_defaults()
     assert args.latent_distribution == 'poisson'
     assert args.poisson_gradient_estimator == 'straight_through'
+    assert args.poisson_sampling_backend == 'fresh'
     assert args.scale_connection == 'last_sample'
     assert args.num_nf == 0
 
 
 def test_ste_exact_forward_and_weighted_rate_gradient():
     raw_log_rate = torch.tensor([-1.5, -0.2, 0.8, 1.7], requires_grad=True)
-    dist = Poisson(raw_log_rate, max_count=1)
+    dist = Poisson(raw_log_rate, max_count=1, sampler=PoissonSampler('native'))
     torch.manual_seed(71)
     expected = torch.poisson(dist.rate.detach())
     torch.manual_seed(71)

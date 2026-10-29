@@ -10,24 +10,7 @@ from pathlib import Path
 import torch
 
 
-class Sampler:
-    def __init__(self, backend, seed):
-        self.backend = backend
-        self.seed_source = torch.Generator().manual_seed(seed + 100003)
-
-    def __call__(self, rate):
-        if self.backend == 'native':
-            return torch.poisson(rate)
-        if self.backend == 'cpu':
-            cpu_dtype = torch.float64 if rate.dtype == torch.float64 else torch.float32
-            return torch.poisson(rate.detach().to(device='cpu', dtype=cpu_dtype)).to(rate)
-        if self.backend == 'fresh':
-            # A diagnostic: separate seed for each call, drawn on CPU. It is
-            # not a validated workaround until the target GPU passes probes.
-            seed = int(torch.randint(0, 2**63 - 1, (1,), generator=self.seed_source).item())
-            generator = torch.Generator(device=rate.device).manual_seed(seed)
-            return torch.poisson(rate, generator=generator)
-        raise ValueError('Unknown backend: %s' % self.backend)
+from poisson_sampling import PoissonSampler as Sampler
 
 
 class PairStats:

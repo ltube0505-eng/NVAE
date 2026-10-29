@@ -16,6 +16,7 @@ from torch.multiprocessing import Process
 from torch.cuda.amp import autocast, GradScaler
 
 from model import AutoEncoder
+from poisson_sampling import collect_sampler_states, restore_sampler_state
 from thirdparty.adamax import Adamax
 import utils
 import datasets
@@ -73,6 +74,9 @@ def main(args):
         checkpoint = torch.load(checkpoint_file, map_location='cpu')
         init_epoch = checkpoint['epoch']
         model.load_state_dict(checkpoint['state_dict'])
+        restored_rng = restore_sampler_state(model.poisson_sampler,
+                                             checkpoint.get('poisson_rng_states'), args.global_rank)
+        logging.info('Poisson sampler RNG state restored: %s', restored_rng)
         model = model.cuda()
         cnn_optimizer.load_state_dict(checkpoint['optimizer'])
         grad_scalar.load_state_dict(checkpoint['grad_scalar'])
@@ -124,12 +128,14 @@ def main(args):
 
         save_freq = int(np.ceil(args.epochs / 100))
         if epoch % save_freq == 0 or epoch == (args.epochs - 1):
+            poisson_rng_states = collect_sampler_states(model.poisson_sampler, args.distributed)
             if args.global_rank == 0:
                 logging.info('saving the model.')
                 torch.save({'epoch': epoch + 1, 'state_dict': model.state_dict(),
                             'optimizer': cnn_optimizer.state_dict(), 'global_step': global_step,
                             'args': args, 'arch_instance': arch_instance, 'scheduler': cnn_scheduler.state_dict(),
-                            'grad_scalar': grad_scalar.state_dict()}, checkpoint_file)
+                            'grad_scalar': grad_scalar.state_dict(),
+                            'poisson_rng_states': poisson_rng_states}, checkpoint_file)
 
     # Final validation
     valid_neg_log_p, valid_nelbo = test(valid_queue, model, num_samples=1000, args=args, logging=logging)
@@ -456,6 +462,10 @@ if __name__ == '__main__':
                         choices=['relaxed', 'reinforce', 'obbvi', 'straight_through'],
                         help='Poisson gradient estimator; straight_through uses exact counts '
                              'and the rate-identity STE backward path')
+    parser.add_argument('--poisson_sampling_backend', type=str, default='fresh',
+                        choices=['fresh', 'cpu', 'native'],
+                        help='Poisson integer sampler: per-call fresh device RNG (default), '
+                             'CPU reference, or legacy native RNG for diagnostics')
     parser.add_argument('--poisson_relaxation_temperature', type=float, default=0.1,
                         help='sigmoid temperature for relaxed Poisson arrival indicators (unused by STE)')
     parser.add_argument('--poisson_max_count', type=int, default=64,
