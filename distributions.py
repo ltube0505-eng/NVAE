@@ -11,6 +11,7 @@ import torch.nn.functional as F
 import numpy as np
 
 from utils import one_hot
+from entropy_regularization import poisson_entropy
 
 @torch.jit.script
 def soft_clamp5(x: torch.Tensor):
@@ -77,6 +78,11 @@ class Poisson:
         self.log_rate = torch.log(self.rate)
         self.relaxation_temperature = relaxation_temperature
         self.max_count = max_count
+        self.entropy_rate_bound = min(float(max_rate), float(np.exp(5.)))
+
+    def entropy(self):
+        """Entropy of the underlying discrete Poisson, not relaxed samples."""
+        return poisson_entropy(self.rate, self.entropy_rate_bound)
 
     def _arrival_counts(self):
         """Return hard and relaxed counts built from the same arrivals."""
@@ -355,3 +361,4 @@ class DiscMixLogistic:
         x = torch.cat([x0, x1, x2], 1)
         x = x / 2. + 0.5
         return x
+

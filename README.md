@@ -14,6 +14,15 @@ likelihood-based generative models on several image datasets.
     <img src="img/celebahq.png" width="800">
 </p>
 
+## Annealed Poisson posterior entropy (this branch)
+
+All-Poisson training defaults to `ELBO - alpha * H(q)`, with alpha starting
+at 0.1 and cosine-decaying to zero halfway through training. This mode uses
+full, unbalanced KL from the start. See
+[the objective, estimator details, schedule and diagnostics](docs/poisson_entropy_annealing.md).
+Run the compact MNIST example with `bash scripts/train_mnist_poisson_entropy.sh`.
+Use `--poisson_objective nvae` to restore the parent branch training objective.
+
 ## Requirements
 NVAE is built in Python 3.7 using PyTorch 1.6.0. Use the following command to install the requirements:
 ```
@@ -431,3 +440,4 @@ Please cite our paper, if you happen to use this codebase:
   year={2020}
 }
 ```
+

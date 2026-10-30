@@ -19,12 +19,17 @@ from model import AutoEncoder
 from thirdparty.adamax import Adamax
 import utils
 import datasets
+from entropy_regularization import entropy_alpha
 
 from fid.fid_score import compute_statistics_of_generator, load_statistics, calculate_frechet_distance
 from fid.inception import InceptionV3
 
 
 def main(args):
+    entropy_objective = (args.latent_distribution == 'poisson' and
+                         args.poisson_objective == 'elbo_alpha')
+    entropy_alpha(0, 2, args.poisson_entropy_alpha_init,
+                  args.poisson_entropy_anneal_portion)  # validate before loading data
     # ensures that weight initializations are all the same
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -48,6 +53,11 @@ def main(args):
     logging.info('args = %s', args)
     logging.info('param size = %fM ', utils.count_parameters_in_M(model))
     logging.info('groups per scale: %s, total_groups: %d', model.groups_per_scale, sum(model.groups_per_scale))
+    if entropy_objective:
+        logging.info('Poisson L_alpha: full unbalanced KL (beta=1), alpha %.6g -> 0 '
+                     'with cosine decay over %.1f%% of optimizer steps; '
+                     'existing weight/norm regularizers remain separate.',
+                     args.poisson_entropy_alpha_init, 100. * args.poisson_entropy_anneal_portion)
 
     if args.fast_adamax:
         # Fast adamax has the same functionality as torch.optim.Adamax, except it is faster.
@@ -76,6 +86,11 @@ def main(args):
         grad_scalar.load_state_dict(checkpoint['grad_scalar'])
         cnn_scheduler.load_state_dict(checkpoint['scheduler'])
         global_step = checkpoint['global_step']
+        saved_schedule = checkpoint.get('entropy_schedule')
+        current_schedule = entropy_schedule_config(args)
+        if saved_schedule is not None and saved_schedule != current_schedule:
+            raise ValueError('Resume must preserve entropy_schedule and total steps. '
+                             'Saved: %s; requested: %s' % (saved_schedule, current_schedule))
     else:
         global_step, init_epoch = 0, 0
 
@@ -127,7 +142,8 @@ def main(args):
                 torch.save({'epoch': epoch + 1, 'state_dict': model.state_dict(),
                             'optimizer': cnn_optimizer.state_dict(), 'global_step': global_step,
                             'args': args, 'arch_instance': arch_instance, 'scheduler': cnn_scheduler.state_dict(),
-                            'grad_scalar': grad_scalar.state_dict()}, checkpoint_file)
+                            'grad_scalar': grad_scalar.state_dict(),
+                            'entropy_schedule': entropy_schedule_config(args) if entropy_objective else None}, checkpoint_file)
 
     # Final validation
     valid_neg_log_p, valid_nelbo = test(valid_queue, model, num_samples=1000, args=args, logging=logging)
@@ -140,10 +156,19 @@ def main(args):
     writer.close()
 
 
+def entropy_schedule_config(args):
+    return dict(objective=args.poisson_objective,
+                initial=args.poisson_entropy_alpha_init,
+                anneal_portion=args.poisson_entropy_anneal_portion,
+                total_steps=args.num_total_iter)
+
+
 def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_iters, writer, logging):
     alpha_i = utils.kl_balancer_coeff(num_scales=model.num_latent_scales,
                                       groups_per_scale=model.groups_per_scale, fun='square')
     nelbo = utils.AvgrageMeter()
+    entropy_objective = (model.latent_distribution == 'poisson' and
+                         args.poisson_objective == 'elbo_alpha')
     model.train()
     for step, x in enumerate(train_queue):
         x = x[0] if len(x) > 1 else x
@@ -166,7 +191,17 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
         with autocast():
             kl_coeff = utils.kl_coeff(global_step, args.kl_anneal_portion * args.num_total_iter,
                                       args.kl_const_portion * args.num_total_iter, args.kl_const_coeff)
+            scheduled_kl_coeff = kl_coeff
+            # L_alpha = reconstruction - KL - alpha*H needs beta=1 and no
+            # group KL balancing, even during the entropy annealing phase.
+            if entropy_objective:
+                kl_coeff = 1.
+            entropy_coeff = entropy_alpha(
+                global_step, args.num_total_iter, args.poisson_entropy_alpha_init,
+                args.poisson_entropy_anneal_portion) if entropy_objective else 0.
             score_estimator = model.poisson_gradient_estimator in {'reinforce', 'obbvi'}
+            model.collect_posterior_entropy = entropy_coeff > 0. and not score_estimator
+            entropy_batch = None
             importance_ess = None
 
             if score_estimator:
@@ -179,6 +214,7 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
 
                 baseline = model.score_baseline(x)
                 objectives, sampled_nelbos, importance_weights = [], [], []
+                regularized_signals, entropy_samples = [], []
                 kl_samples, kl_diag_samples, recon_samples = [], [], []
                 for sample_index in range(num_gradient_samples):
                     if model.poisson_gradient_estimator == 'obbvi':
@@ -188,9 +224,13 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
                     output = model.decoder_output(logits)
                     recon_loss_i = utils.reconstruction_loss(output, x, crop=model.crop_output)
                     objective_i, sampled_nelbo_i, importance_weight_i = \
-                        model.score_function_objective(recon_loss_i, kl_coeff, baseline)
+                        model.score_function_objective(recon_loss_i, kl_coeff, baseline,
+                                                       entropy_alpha=entropy_coeff)
                     objectives.append(objective_i)
-                    sampled_nelbos.append(sampled_nelbo_i)
+                    regularized_signals.append(sampled_nelbo_i)
+                    entropy_i = -log_q.detach().float()
+                    entropy_samples.append(entropy_i)
+                    sampled_nelbos.append(sampled_nelbo_i - entropy_coeff * entropy_i)
                     importance_weights.append(importance_weight_i)
                     kl_samples.append(kl_all_i)
                     kl_diag_samples.append(kl_diag_i)
@@ -198,11 +238,14 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
 
                 # Update only after all current samples have used the old baseline;
                 # this keeps the control variate independent of those samples.
-                model.update_score_baseline(sampled_nelbos)
+                model.update_score_baseline(regularized_signals)
                 loss = torch.mean(torch.stack(objectives))
                 weight_stack = torch.stack(importance_weights)
                 signal_stack = torch.stack(sampled_nelbos)
                 nelbo_batch = torch.mean(weight_stack * signal_stack, dim=0)
+                entropy_batch = torch.mean(weight_stack * torch.stack(entropy_samples), dim=0)
+                objective_batch = torch.mean(
+                    weight_stack * torch.stack(regularized_signals), dim=0)
                 recon_loss = torch.mean(torch.stack(recon_samples), dim=0)
                 importance_ess = torch.mean(
                     torch.sum(weight_stack, dim=0) ** 2 /
@@ -218,9 +261,13 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
                 output = model.decoder_output(logits)
                 recon_loss = utils.reconstruction_loss(output, x, crop=model.crop_output)
                 balanced_kl, kl_coeffs, kl_vals = utils.kl_balancer(
-                    kl_all, kl_coeff, kl_balance=True, alpha_i=alpha_i)
+                    kl_all, kl_coeff, kl_balance=not entropy_objective, alpha_i=alpha_i)
                 nelbo_batch = recon_loss + balanced_kl
-                loss = torch.mean(nelbo_batch)
+                objective_batch = nelbo_batch
+                if entropy_coeff > 0.:
+                    entropy_batch = model.posterior_entropy()
+                    objective_batch = objective_batch + entropy_coeff * entropy_batch
+                loss = torch.mean(objective_batch)
 
             reported_nelbo = torch.mean(nelbo_batch.detach())
             norm_loss = model.spectral_norm_parallel()
@@ -228,7 +275,7 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
             # get spectral regularization coefficient (lambda)
             if args.weight_decay_norm_anneal:
                 assert args.weight_decay_norm_init > 0 and args.weight_decay_norm > 0, 'init and final wdn should be positive.'
-                wdn_coeff = (1. - kl_coeff) * np.log(args.weight_decay_norm_init) + kl_coeff * np.log(args.weight_decay_norm)
+                wdn_coeff = (1. - scheduled_kl_coeff) * np.log(args.weight_decay_norm_init) + scheduled_kl_coeff * np.log(args.weight_decay_norm)
                 wdn_coeff = np.exp(wdn_coeff)
             else:
                 wdn_coeff = args.weight_decay_norm
@@ -263,6 +310,17 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
             writer.add_scalar('train/lr', cnn_optimizer.state_dict()[
                               'param_groups'][0]['lr'], global_step)
             writer.add_scalar('train/nelbo_iter', reported_nelbo, global_step)
+            writer.add_scalar('train/negative_elbo_alpha', objective_batch.detach().mean(), global_step)
+            writer.add_scalar('train/entropy_alpha', entropy_coeff, global_step)
+            if entropy_batch is not None:
+                writer.add_scalar('train/posterior_entropy_nats', entropy_batch.detach().mean(), global_step)
+                writer.add_scalar('train/entropy_penalty_nats',
+                                  entropy_coeff * entropy_batch.detach().mean(), global_step)
+            else:
+                writer.add_scalar('train/entropy_penalty_nats', 0., global_step)
+            if entropy_objective:
+                logging.info('L_alpha step %d alpha %.6g negative_elbo_alpha %.6f',
+                             global_step, entropy_coeff, objective_batch.detach().mean().item())
             writer.add_scalar('train/kl_iter', torch.mean(sum(kl_all)), global_step)
             writer.add_scalar('train/recon_iter', torch.mean(recon_loss), global_step)
             writer.add_scalar('kl_coeff/coeff', kl_coeff, global_step)
@@ -292,6 +350,7 @@ def test(valid_queue, model, num_samples, args, logging):
     nelbo_avg = utils.AvgrageMeter()
     neg_log_p_avg = utils.AvgrageMeter()
     model.eval()
+    model.collect_posterior_entropy = False
     for step, x in enumerate(valid_queue):
         x = x[0] if len(x) > 1 else x
         x = x.cuda()
@@ -449,6 +508,13 @@ if __name__ == '__main__':
                         help='number of exponential arrivals used by relaxed Poisson sampling')
     parser.add_argument('--poisson_max_rate', type=float, default=30.,
                         help='upper bound on Poisson rates to control count truncation')
+    parser.add_argument('--poisson_objective', choices=['elbo_alpha', 'nvae'], default='elbo_alpha',
+                        help='all-Poisson only: elbo_alpha uses full KL plus annealed entropy penalty; '
+                             'nvae restores the parent branch objective and KL schedule')
+    parser.add_argument('--poisson_entropy_alpha_init', type=float, default=0.1,
+                        help='initial alpha in ELBO-alpha*H(q), in [0,1)')
+    parser.add_argument('--poisson_entropy_anneal_portion', type=float, default=0.5,
+                        help='fraction of optimizer-step span for cosine alpha decay to zero')
     parser.add_argument('--reinforce_num_samples', type=int, default=1,
                         help='exact posterior samples per minibatch for REINFORCE')
     parser.add_argument('--score_baseline_decay', type=float, default=0.9,
@@ -529,3 +595,4 @@ if __name__ == '__main__':
         print('starting in debug mode')
         args.distributed = True
         init_processes(0, size, main, args)
+

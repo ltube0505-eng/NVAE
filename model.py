@@ -147,6 +147,8 @@ class AutoEncoder(nn.Module):
         self._score_baseline_value = None
         self._obbvi_component = 0
         self._gradient_context = None
+        self.collect_posterior_entropy = False
+        self._posterior_entropy = None
 
         self.num_latent_scales = args.num_latent_scales         # number of spatial scales that latent layers will reside
         self.num_groups_per_scale = args.num_groups_per_scale   # number of groups of latent vars. per scale
@@ -451,18 +453,33 @@ class AutoEncoder(nn.Module):
             self._score_baseline_value = decay * self._score_baseline_value + \
                 (1. - decay) * value
 
-    def score_function_objective(self, recon_loss, kl_coeff, baseline):
+    def posterior_entropy(self):
+        """Sum of conditional group entropies for the last sampled prefix.
+
+        Averaging over posterior prefixes estimates the JOINT entropy by
+        the chain rule; this is not the entropy of marginal Poisson mixtures.
+        """
+        if self._posterior_entropy is None:
+            raise RuntimeError('Enable collect_posterior_entropy before forward().')
+        return self._posterior_entropy
+
+    def score_function_objective(self, recon_loss, kl_coeff, baseline, entropy_alpha=0.):
         """Build the exact-sample REINFORCE/O-BBVI surrogate objective.
 
-        The returned first tensor is differentiated. The sampled NELBO and
+        The returned first tensor is differentiated. The sampled loss and
         importance weight are detached diagnostics. Proposal weights are also
         detached so autograd does not differentiate through the sampler.
+        With entropy_alpha > 0 the sampled loss includes -alpha * log_q.
+        Its full joint log_q score propagates the entropy cost through ALL
+        ancestor groups, including under the O-BBVI proposal distribution.
         """
         if self._gradient_context is None:
             raise RuntimeError('forward() must run before requesting a score objective.')
         log_q = self._gradient_context['log_q']
         log_p = self._gradient_context['log_p']
         sampled_nelbo = recon_loss.float() + float(kl_coeff) * (log_q - log_p)
+        if entropy_alpha != 0.:
+            sampled_nelbo = sampled_nelbo - float(entropy_alpha) * log_q
 
         if self.poisson_gradient_estimator == 'obbvi':
             log_proposal = self._gradient_context['log_proposal']
@@ -473,11 +490,14 @@ class AutoEncoder(nn.Module):
         centered_signal = sampled_nelbo.detach() - baseline
         # Direct gradients train p_theta(x,z); the likelihood-ratio term trains
         # every parameter that participates in q_phi(z|x).
+        # The omitted direct (kl_coeff-alpha)*grad(log_q) has expectation
+        # zero under q, also after detached importance weighting under DMIS.
         generative = importance_weight * (recon_loss.float() - float(kl_coeff) * log_p)
         inference = importance_weight * centered_signal * log_q
         return generative + inference, sampled_nelbo.detach(), importance_weight
 
     def forward(self, x):
+        self._posterior_entropy = None
         s = self.stem(2 * x - 1.0)
 
         # perform pre-processing
@@ -590,6 +610,11 @@ class AutoEncoder(nn.Module):
             log_p += torch.sum(log_p_conv, dim=[1, 2, 3])
 
         self._gradient_context = {'log_q': log_q.float(), 'log_p': log_p.float()}
+        if self.collect_posterior_entropy:
+            if self.latent_distribution != 'poisson':
+                raise ValueError('Joint discrete entropy requires all-Poisson latents.')
+            self._posterior_entropy = sum(
+                q.entropy().sum(dim=[1, 2, 3]) for q in all_q)
         if self.training and self.poisson_gradient_estimator == 'obbvi':
             if len(all_proposal_log_probs) != len(all_q):
                 raise RuntimeError('O-BBVI requires every latent group to be Poisson.')
@@ -696,3 +721,4 @@ class AutoEncoder(nn.Module):
                 loss += torch.max(torch.abs(l.weight))
 
         return loss
+
