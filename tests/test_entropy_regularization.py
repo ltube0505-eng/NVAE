@@ -64,7 +64,8 @@ def test_entropy_float32_half_and_sampler_cap_independence():
 
 @pytest.mark.parametrize('estimator', ['reinforce', 'obbvi'])
 @pytest.mark.parametrize('alpha', [0., .1, .5])
-def test_hierarchical_score_gradient_matches_enumerated_objective(estimator, alpha):
+@pytest.mark.parametrize('beta', [.0001, .2, 1.])
+def test_hierarchical_score_gradient_matches_enumerated_objective(estimator, alpha, beta):
     # q(z1)*q(z2|z1): downstream entropy depends on BOTH parameters. This
     # catches missing ancestor score terms and missing O-BBVI weighting.
     parameters = torch.tensor([-.3, -.2], dtype=torch.float64, requires_grad=True)
@@ -79,7 +80,7 @@ def test_hierarchical_score_gradient_matches_enumerated_objective(estimator, alp
     log_p = (torch.distributions.Poisson(prior_log_rate.exp()).log_prob(z1) +
              torch.distributions.Poisson(prior_log_rate.exp()).log_prob(z2))
     recon = .03 * (z1 + z2 - 2.) ** 2
-    expected = (log_q.exp() * (recon + (1. - alpha) * log_q - log_p)).sum()
+    expected = (log_q.exp() * (recon + (beta - alpha) * log_q - beta * log_p)).sum()
     expected_grads = torch.autograd.grad(expected, (parameters, prior_log_rate), retain_graph=True)
 
     context = dict(log_q=log_q, log_p=log_p)
@@ -95,7 +96,7 @@ def test_hierarchical_score_gradient_matches_enumerated_objective(estimator, alp
         sampling_probability = log_q.detach().exp()
     stub = SimpleNamespace(_gradient_context=context, poisson_gradient_estimator=estimator)
     surrogate, signal, weight = AutoEncoder.score_function_objective(
-        stub, recon, 1., .7, entropy_alpha=alpha)
+        stub, recon, beta, .7, entropy_alpha=alpha)
     actual_grads = torch.autograd.grad((sampling_probability * surrogate).sum(),
                                       (parameters, prior_log_rate))
     for actual, expected_grad in zip(actual_grads, expected_grads):
@@ -136,7 +137,8 @@ def test_zero_alpha_preserves_score_surrogate():
 
 @pytest.mark.parametrize('estimator', ['relaxed', 'straight_through', 'reinforce', 'obbvi'])
 @pytest.mark.parametrize('step', [99, 499, 1099])
-def test_training_loop_uses_full_kl_and_reports_unpenalized_elbo(monkeypatch, tmp_path, estimator, step):
+@pytest.mark.parametrize('objective', ['elbo_alpha', 'nvae_alpha'])
+def test_training_loop_kl_policy_and_entropy(monkeypatch, tmp_path, estimator, step, objective):
     # Load the actual training function without importing GPU/data/FID-only
     # entrypoint dependencies. Only CUDA transport and norm regularizers are
     # replaced; model, objective, optimizer and backward remain real.
@@ -151,7 +153,7 @@ def test_training_loop_uses_full_kl_and_reports_unpenalized_elbo(monkeypatch, tm
     tree = ast.parse((Path(__file__).resolve().parents[1] / 'train.py').read_text())
     tree.body = [node for node in tree.body
                  if isinstance(node, ast.FunctionDef) and node.name == 'train']
-    args = SimpleNamespace(poisson_objective='elbo_alpha', num_x_bits=8,
+    args = SimpleNamespace(poisson_objective=objective, num_x_bits=8,
                            learning_rate=.001, distributed=False,
                            kl_anneal_portion=.3, kl_const_portion=.0001,
                            kl_const_coeff=.0001, num_total_iter=2001,
@@ -176,13 +178,28 @@ def test_training_loop_uses_full_kl_and_reports_unpenalized_elbo(monkeypatch, tm
         add_histogram=lambda *a, **kw: None)
     logger = SimpleNamespace(info=lambda *a: None)
     x = torch.bernoulli(torch.full((2, 1, 32, 32), .5))
+    original_balancer = utils.kl_balancer
+    balance_calls = []
+
+    def record_balance(*a, **kw):
+        result = original_balancer(*a, **kw)
+        balance_calls.append((kw.get('kl_balance'), result[1]))
+        return result
+
+    monkeypatch.setattr(utils, 'kl_balancer', record_balance)
     _, end_step = namespace['train']([(x, None)], model, optimizer, scaler, step, 0, writer, logger)
     assert end_step == step + 1
     if step == 499:
         snapshot = tmp_path / 'posterior_rate_monitor' / 'group_001' / 'step_000000500.npz'
         with np.load(str(snapshot)) as data:
             np.testing.assert_array_equal(data['rates'], model.group1_posterior_rates.numpy())
-    assert logged['kl_coeff/coeff'] == 1.
+    expected_beta = (1. if objective == 'elbo_alpha' else
+                     utils.kl_coeff(step, .3 * 2001, .0001 * 2001, .0001))
+    assert logged['kl_coeff/coeff'] == expected_beta
+    expect_balance = objective == 'nvae_alpha' and estimator in ('relaxed', 'straight_through')
+    assert balance_calls[0][0] == expect_balance
+    if expect_balance and expected_beta < 1.:
+        assert not torch.equal(balance_calls[0][1], torch.ones_like(balance_calls[0][1]))
     assert logged['train/entropy_alpha'] == entropy_alpha(step, 2001)
     assert logged['train/negative_elbo_alpha'] == pytest.approx(
         logged['train/nelbo_iter'] + logged['train/entropy_penalty_nats'], rel=2e-5)
@@ -191,3 +208,57 @@ def test_training_loop_uses_full_kl_and_reports_unpenalized_elbo(monkeypatch, tm
         assert not model.collect_posterior_entropy
     else:
         assert logged['train/entropy_penalty_nats'] > 0.
+
+
+@pytest.mark.parametrize('estimator', ['relaxed', 'straight_through', 'reinforce', 'obbvi'])
+@pytest.mark.parametrize('step', [99, 1099])
+def test_zero_entropy_recovers_parent_loss_and_gradients(monkeypatch, estimator, step):
+    import ast
+    import contextlib
+    from pathlib import Path
+    import numpy as np
+    import utils
+    from test_mixed_model import _poisson_model
+
+    tree = ast.parse((Path(__file__).resolve().parents[1] / 'train.py').read_text())
+    tree.body = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'train']
+    args = SimpleNamespace(poisson_objective='nvae', num_x_bits=8,
+                           learning_rate=.001, distributed=False,
+                           kl_anneal_portion=.3, kl_const_portion=.0001,
+                           kl_const_coeff=.0001, num_total_iter=2001,
+                           poisson_entropy_alpha_init=0., poisson_entropy_anneal_portion=.5,
+                           poisson_rate_monitor_every=0,
+                           weight_decay_norm_anneal=True, weight_decay_norm=.01,
+                           weight_decay_norm_init=10.)
+    namespace = dict(torch=torch, np=np, utils=utils, args=args,
+                     entropy_alpha=entropy_alpha, autocast=contextlib.nullcontext)
+    exec(compile(tree, 'train.py', 'exec'), namespace)
+    monkeypatch.setattr(torch.Tensor, 'cuda', lambda self, *a, **kw: self)
+    model = _poisson_model(estimator)
+    initial = {k: v.clone() for k, v in model.state_dict().items()}
+    monkeypatch.setattr(model, 'spectral_norm_parallel', lambda: torch.tensor(2.))
+    monkeypatch.setattr(model, 'batchnorm_loss', lambda: torch.tensor(3.))
+    x = torch.bernoulli(torch.full((2, 1, 32, 32), .5))
+    runs = []
+    for objective in ('nvae', 'nvae_alpha'):
+        args.poisson_objective = objective
+        model.load_state_dict(initial)
+        model._score_baseline_value = None
+        optimizer = torch.optim.SGD(model.parameters(), lr=.00001)
+        scaler = SimpleNamespace(scale=lambda loss: loss, step=lambda opt: opt.step(), update=lambda: None)
+        logged = {}
+        writer = SimpleNamespace(add_scalar=lambda name, value, s: logged.update({
+            name: float(value.detach() if isinstance(value, torch.Tensor) else value)}))
+        with torch.random.fork_rng():
+            torch.manual_seed(812)
+            namespace['train']([(x, None)], model, optimizer, scaler, step, 0,
+                               writer, SimpleNamespace(info=lambda *a: None))
+        runs.append((logged, {k: v.clone() for k, v in model.state_dict().items()},
+                     {k: p.grad.clone() for k, p in model.named_parameters() if p.grad is not None}))
+    for key in ('train/negative_elbo_alpha', 'train/nelbo_iter', 'kl_coeff/coeff', 'train/norm_coeff'):
+        assert runs[0][0][key] == runs[1][0][key]
+    for section in (1, 2):
+        assert runs[0][section].keys() == runs[1][section].keys()
+        for key in runs[0][section]:
+            assert torch.equal(runs[0][section][key], runs[1][section][key]), key
+

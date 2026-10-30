@@ -28,7 +28,7 @@ from fid.inception import InceptionV3
 
 def main(args):
     entropy_objective = (args.latent_distribution == 'poisson' and
-                         args.poisson_objective == 'elbo_alpha')
+                         args.poisson_objective in {'elbo_alpha', 'nvae_alpha'})
     entropy_alpha(0, 2, args.poisson_entropy_alpha_init,
                   args.poisson_entropy_anneal_portion)  # validate before loading data
     if args.poisson_rate_monitor_every < 0:
@@ -57,10 +57,17 @@ def main(args):
     logging.info('param size = %fM ', utils.count_parameters_in_M(model))
     logging.info('groups per scale: %s, total_groups: %d', model.groups_per_scale, sum(model.groups_per_scale))
     if entropy_objective:
-        logging.info('Poisson L_alpha: full unbalanced KL (beta=1), alpha %.6g -> 0 '
+        logging.info('Poisson entropy objective %s: alpha %.6g -> 0 '
                      'with cosine decay over %.1f%% of optimizer steps; '
                      'existing weight/norm regularizers remain separate.',
-                     args.poisson_entropy_alpha_init, 100. * args.poisson_entropy_anneal_portion)
+                     args.poisson_objective, args.poisson_entropy_alpha_init,
+                     100. * args.poisson_entropy_anneal_portion)
+        if args.poisson_objective == 'nvae_alpha':
+            logging.info('Original NVAE KL schedule and estimator-specific group balancing preserved; '
+                         'kl_anneal_portion=%g kl_const_portion=%g kl_const_coeff=%g.',
+                         args.kl_anneal_portion, args.kl_const_portion, args.kl_const_coeff)
+        else:
+            logging.info('Full unbalanced KL (beta=1), without KL warm-up.')
 
     if args.fast_adamax:
         # Fast adamax has the same functionality as torch.optim.Adamax, except it is faster.
@@ -160,10 +167,15 @@ def main(args):
 
 
 def entropy_schedule_config(args):
-    return dict(objective=args.poisson_objective,
-                initial=args.poisson_entropy_alpha_init,
-                anneal_portion=args.poisson_entropy_anneal_portion,
-                total_steps=args.num_total_iter)
+    config = dict(objective=args.poisson_objective,
+                  initial=args.poisson_entropy_alpha_init,
+                  anneal_portion=args.poisson_entropy_anneal_portion,
+                  total_steps=args.num_total_iter)
+    if args.poisson_objective == 'nvae_alpha':
+        config['kl_schedule'] = dict(anneal_portion=args.kl_anneal_portion,
+                                     const_portion=args.kl_const_portion,
+                                     const_coeff=args.kl_const_coeff)
+    return config
 
 
 def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_iters, writer, logging):
@@ -171,7 +183,7 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
                                       groups_per_scale=model.groups_per_scale, fun='square')
     nelbo = utils.AvgrageMeter()
     entropy_objective = (model.latent_distribution == 'poisson' and
-                         args.poisson_objective == 'elbo_alpha')
+                         args.poisson_objective in {'elbo_alpha', 'nvae_alpha'})
     model.train()
     for step, x in enumerate(train_queue):
         x = x[0] if len(x) > 1 else x
@@ -199,9 +211,9 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
             kl_coeff = utils.kl_coeff(global_step, args.kl_anneal_portion * args.num_total_iter,
                                       args.kl_const_portion * args.num_total_iter, args.kl_const_coeff)
             scheduled_kl_coeff = kl_coeff
-            # L_alpha = reconstruction - KL - alpha*H needs beta=1 and no
-            # group KL balancing, even during the entropy annealing phase.
-            if entropy_objective:
+            # Only the explicit full-ELBO mode overrides the parent schedule.
+            # nvae_alpha adds entropy to the unchanged NVAE training loss.
+            if entropy_objective and args.poisson_objective == 'elbo_alpha':
                 kl_coeff = 1.
             entropy_coeff = entropy_alpha(
                 global_step, args.num_total_iter, args.poisson_entropy_alpha_init,
@@ -268,7 +280,9 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
                 output = model.decoder_output(logits)
                 recon_loss = utils.reconstruction_loss(output, x, crop=model.crop_output)
                 balanced_kl, kl_coeffs, kl_vals = utils.kl_balancer(
-                    kl_all, kl_coeff, kl_balance=not entropy_objective, alpha_i=alpha_i)
+                    kl_all, kl_coeff,
+                    kl_balance=not (entropy_objective and args.poisson_objective == 'elbo_alpha'),
+                    alpha_i=alpha_i)
                 nelbo_batch = recon_loss + balanced_kl
                 objective_batch = nelbo_batch
                 if entropy_coeff > 0.:
@@ -325,6 +339,8 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
                               'param_groups'][0]['lr'], global_step)
             writer.add_scalar('train/nelbo_iter', reported_nelbo, global_step)
             writer.add_scalar('train/negative_elbo_alpha', objective_batch.detach().mean(), global_step)
+            if entropy_objective and args.poisson_objective == 'nvae_alpha':
+                writer.add_scalar('train/negative_nvae_alpha', objective_batch.detach().mean(), global_step)
             writer.add_scalar('train/entropy_alpha', entropy_coeff, global_step)
             if entropy_batch is not None:
                 writer.add_scalar('train/posterior_entropy_nats', entropy_batch.detach().mean(), global_step)
@@ -333,8 +349,9 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
             else:
                 writer.add_scalar('train/entropy_penalty_nats', 0., global_step)
             if entropy_objective:
-                logging.info('L_alpha step %d alpha %.6g negative_elbo_alpha %.6f',
-                             global_step, entropy_coeff, objective_batch.detach().mean().item())
+                logging.info('%s step %d alpha %.6g regularized_loss %.6f',
+                             args.poisson_objective, global_step, entropy_coeff,
+                             objective_batch.detach().mean().item())
             writer.add_scalar('train/kl_iter', torch.mean(sum(kl_all)), global_step)
             writer.add_scalar('train/recon_iter', torch.mean(recon_loss), global_step)
             writer.add_scalar('kl_coeff/coeff', kl_coeff, global_step)
@@ -523,9 +540,11 @@ if __name__ == '__main__':
                         help='number of exponential arrivals used by relaxed Poisson sampling')
     parser.add_argument('--poisson_max_rate', type=float, default=30.,
                         help='upper bound on Poisson rates to control count truncation')
-    parser.add_argument('--poisson_objective', choices=['elbo_alpha', 'nvae'], default='elbo_alpha',
-                        help='all-Poisson only: elbo_alpha uses full KL plus annealed entropy penalty; '
-                             'nvae restores the parent branch objective and KL schedule')
+    parser.add_argument('--poisson_objective', choices=['nvae_alpha', 'elbo_alpha', 'nvae'],
+                        default='nvae_alpha',
+                        help='all-Poisson only: nvae_alpha preserves parent KL warm-up/balancing '
+                             'and adds annealed entropy; elbo_alpha uses full unbalanced KL '
+                             'plus entropy; nvae uses the parent objective without entropy')
     parser.add_argument('--poisson_entropy_alpha_init', type=float, default=0.1,
                         help='initial alpha in ELBO-alpha*H(q), in [0,1)')
     parser.add_argument('--poisson_entropy_anneal_portion', type=float, default=0.5,
@@ -612,4 +631,5 @@ if __name__ == '__main__':
         print('starting in debug mode')
         args.distributed = True
         init_processes(0, size, main, args)
+
 
