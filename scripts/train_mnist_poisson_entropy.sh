@@ -9,7 +9,7 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
 python -u train.py \
   --root /root/autodl-tmp/nvae-checkpoints \
-  --save mnist_poisson_st_official_s2_t01_e200_nvae_alpha01_cos50 \
+  --save mnist_poisson_st_official_s2_t01_e200_nvae_sync_a01_cos50 \
   --dataset mnist \
   --data /root/autodl-tmp/datasets/mnist \
   --arch_instance res_mbconv \
@@ -64,4 +64,5 @@ python -u train.py \
   --master_address 127.0.0.1 \
   --seed 1 \
   "$@"
+
 

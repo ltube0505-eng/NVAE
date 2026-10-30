@@ -149,6 +149,7 @@ class AutoEncoder(nn.Module):
         self._gradient_context = None
         self.collect_posterior_entropy = False
         self._posterior_entropy = None
+        self._posterior_entropy_per_group = None
         self.collect_group1_rates = False
         self.group1_posterior_rates = None
 
@@ -455,7 +456,7 @@ class AutoEncoder(nn.Module):
             self._score_baseline_value = decay * self._score_baseline_value + \
                 (1. - decay) * value
 
-    def posterior_entropy(self):
+    def posterior_entropy(self, group_weights=None):
         """Sum of conditional group entropies for the last sampled prefix.
 
         Averaging over posterior prefixes estimates the JOINT entropy by
@@ -463,6 +464,13 @@ class AutoEncoder(nn.Module):
         """
         if self._posterior_entropy is None:
             raise RuntimeError('Enable collect_posterior_entropy before forward().')
+        if group_weights is not None:
+            weights = torch.as_tensor(group_weights,
+                                      device=self._posterior_entropy_per_group.device,
+                                      dtype=self._posterior_entropy_per_group.dtype).detach()
+            if weights.shape != self._posterior_entropy_per_group.shape[1:]:
+                raise ValueError('Expected one entropy weight per latent group.')
+            return (self._posterior_entropy_per_group * weights).sum(dim=1)
         return self._posterior_entropy
 
     def score_function_objective(self, recon_loss, kl_coeff, baseline, entropy_alpha=0.):
@@ -471,7 +479,9 @@ class AutoEncoder(nn.Module):
         The returned first tensor is differentiated. The sampled loss and
         importance weight are detached diagnostics. Proposal weights are also
         detached so autograd does not differentiate through the sampler.
-        With entropy_alpha > 0 the sampled loss includes -alpha * log_q.
+        entropy_alpha is an absolute coefficient: the training loop passes
+        beta*a to share the KL schedule (score estimators have w_g=1).
+        With entropy_alpha > 0 the sampled loss includes -entropy_alpha*log_q.
         Its full joint log_q score propagates the entropy cost through ALL
         ancestor groups, including under the O-BBVI proposal distribution.
         """
@@ -500,6 +510,7 @@ class AutoEncoder(nn.Module):
 
     def forward(self, x):
         self._posterior_entropy = None
+        self._posterior_entropy_per_group = None
         self.group1_posterior_rates = None
         s = self.stem(2 * x - 1.0)
 
@@ -618,8 +629,9 @@ class AutoEncoder(nn.Module):
         if self.collect_posterior_entropy:
             if self.latent_distribution != 'poisson':
                 raise ValueError('Joint discrete entropy requires all-Poisson latents.')
-            self._posterior_entropy = sum(
-                q.entropy().sum(dim=[1, 2, 3]) for q in all_q)
+            self._posterior_entropy_per_group = torch.stack(
+                [q.entropy().sum(dim=[1, 2, 3]) for q in all_q], dim=1)
+            self._posterior_entropy = self._posterior_entropy_per_group.sum(dim=1)
         if self.training and self.poisson_gradient_estimator == 'obbvi':
             if len(all_proposal_log_probs) != len(all_q):
                 raise RuntimeError('O-BBVI requires every latent group to be Poisson.')
@@ -726,4 +738,5 @@ class AutoEncoder(nn.Module):
                 loss += torch.max(torch.abs(l.weight))
 
         return loss
+
 

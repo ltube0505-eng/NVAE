@@ -17,8 +17,9 @@ likelihood-based generative models on several image datasets.
 ## Annealed Poisson posterior entropy (this branch)
 
 All-Poisson training defaults to `--poisson_objective nvae_alpha`: the parent
-NVAE loss, including its KL warm-up and group balancing, plus `alpha * H(q)`.
-Alpha starts at 0.1 and cosine-decays to zero halfway through training. See
+NVAE reconstruction loss plus `beta * sum_g w_g * (KL_g + a * H_g)`.
+Entropy uses the same detached group weights and KL warm-up coefficient.
+Relative a starts at 0.1 and cosine-decays to zero halfway through training. See
 [the objective, estimator details, schedule and diagnostics](docs/poisson_entropy_annealing.md).
 Run the October 16 MNIST configuration with `bash scripts/train_mnist_poisson_entropy.sh`.
 Use `--poisson_objective nvae` to restore the parent branch training objective.
@@ -441,5 +442,6 @@ Please cite our paper, if you happen to use this codebase:
   year={2020}
 }
 ```
+
 
 

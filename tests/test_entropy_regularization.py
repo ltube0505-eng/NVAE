@@ -80,7 +80,7 @@ def test_hierarchical_score_gradient_matches_enumerated_objective(estimator, alp
     log_p = (torch.distributions.Poisson(prior_log_rate.exp()).log_prob(z1) +
              torch.distributions.Poisson(prior_log_rate.exp()).log_prob(z2))
     recon = .03 * (z1 + z2 - 2.) ** 2
-    expected = (log_q.exp() * (recon + (beta - alpha) * log_q - beta * log_p)).sum()
+    expected = (log_q.exp() * (recon + beta * (1. - alpha) * log_q - beta * log_p)).sum()
     expected_grads = torch.autograd.grad(expected, (parameters, prior_log_rate), retain_graph=True)
 
     context = dict(log_q=log_q, log_p=log_p)
@@ -96,7 +96,7 @@ def test_hierarchical_score_gradient_matches_enumerated_objective(estimator, alp
         sampling_probability = log_q.detach().exp()
     stub = SimpleNamespace(_gradient_context=context, poisson_gradient_estimator=estimator)
     surrogate, signal, weight = AutoEncoder.score_function_objective(
-        stub, recon, beta, .7, entropy_alpha=alpha)
+        stub, recon, beta, .7, entropy_alpha=beta * alpha)
     actual_grads = torch.autograd.grad((sampling_probability * surrogate).sum(),
                                       (parameters, prior_log_rate))
     for actual, expected_grad in zip(actual_grads, expected_grads):
@@ -133,6 +133,23 @@ def test_zero_alpha_preserves_score_surrogate():
     a = AutoEncoder.score_function_objective(model, torch.tensor([4.]), 1., 0.)
     b = AutoEncoder.score_function_objective(model, torch.tensor([4.]), 1., 0., entropy_alpha=0.)
     assert all(torch.equal(left, right) for left, right in zip(a, b))
+
+
+def test_group_weighted_entropy_value_and_gradient_detaches_weights():
+    # Distinct entropies and strongly unequal weights detect accidental
+    # averaging, missing weights, and gradients leaking through KL weights.
+    groups = torch.tensor([[1., 3., 8.], [2., 5., 9.]], requires_grad=True)
+    weights = torch.tensor([.2, .7, 2.1], requires_grad=True)
+    stub = SimpleNamespace(_posterior_entropy=groups.sum(1),
+                           _posterior_entropy_per_group=groups)
+    value = AutoEncoder.posterior_entropy(stub, group_weights=weights)
+    expected = (groups * weights.detach()).sum(1)
+    assert torch.equal(value, expected)
+    (.0001 * .1 * value.mean()).backward()
+    assert weights.grad is None
+    assert torch.allclose(groups.grad, (.0001 * .1 / 2.) * weights.detach().expand_as(groups))
+    with pytest.raises(ValueError):
+        AutoEncoder.posterior_entropy(stub, group_weights=[1., 2.])
 
 
 @pytest.mark.parametrize('estimator', ['relaxed', 'straight_through', 'reinforce', 'obbvi'])
@@ -188,6 +205,15 @@ def test_training_loop_kl_policy_and_entropy(monkeypatch, tmp_path, estimator, s
         return result
 
     monkeypatch.setattr(utils, 'kl_balancer', record_balance)
+    entropy_calls = []
+    original_entropy = model.posterior_entropy
+
+    def record_entropy(group_weights=None):
+        result = original_entropy(group_weights)
+        entropy_calls.append((group_weights, result.detach().clone()))
+        return result
+
+    monkeypatch.setattr(model, 'posterior_entropy', record_entropy)
     _, end_step = namespace['train']([(x, None)], model, optimizer, scaler, step, 0, writer, logger)
     assert end_step == step + 1
     assert list(tmp_path.iterdir()) == []
@@ -216,6 +242,16 @@ def test_training_loop_kl_policy_and_entropy(monkeypatch, tmp_path, estimator, s
         assert not model.collect_posterior_entropy
     else:
         assert logged['train/entropy_penalty_nats'] > 0.
+        a = entropy_alpha(step, 2001)
+        if estimator in ('relaxed', 'straight_through'):
+            assert len(entropy_calls) == 2
+            assert torch.allclose(entropy_calls[1][0], balance_calls[0][1])
+            expected_penalty = expected_beta * a * entropy_calls[1][1].mean().item()
+        else:
+            expected_penalty = expected_beta * a * logged['train/posterior_entropy_nats']
+        assert logged['train/entropy_penalty_nats'] == pytest.approx(expected_penalty, rel=2e-5)
+        for i, w in enumerate(balance_calls[0][1]):
+            assert logged['entropy_coeff/layer_%d' % i] == pytest.approx(expected_beta * a * w.item())
 
 
 @pytest.mark.parametrize('estimator', ['relaxed', 'straight_through', 'reinforce', 'obbvi'])
@@ -269,4 +305,5 @@ def test_zero_entropy_recovers_parent_loss_and_gradients(monkeypatch, estimator,
         assert runs[0][section].keys() == runs[1][section].keys()
         for key in runs[0][section]:
             assert torch.equal(runs[0][section][key], runs[1][section][key]), key
+
 

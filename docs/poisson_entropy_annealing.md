@@ -9,7 +9,7 @@ For all-Poisson models, `train.py` now defaults to
 `--poisson_objective nvae_alpha`. The minimized training loss is
 
 ```
-loss(x, step) = parent_NVAE_loss(x, step) + alpha(step) * H(q(z|x)).
+loss(x, step) = reconstruction_nll + beta(step) * sum_g w_g * (KL_g + a(step) * H_g).
 ```
 
 For ST/relaxed training, the parent probabilistic loss is reconstruction NLL
@@ -18,16 +18,20 @@ plus the original annealed, adaptively balanced group KL. The exact
 calls are preserved. Balancing is active only while beta < 1, just as in the
 parent. REINFORCE/O-BBVI preserve their parent's sampled joint KL and beta
 schedule; the parent did not use adaptive group balancing for those estimators.
-The entropy penalty is added separately, without beta or group-balancing weights.
+The entropy penalty uses exactly the same beta and group weights as the KL.
+Group weights are detached in BOTH terms. With score estimators, w_g=1,
+matching their original KL policy. The alpha CLI flags now schedule the
+relative coefficient a; the effective entropy coefficient of group g is
+beta * w_g * a. This replaces the previous separately weighted entropy loss.
 Optimizer weight decay and spectral/BN regularizers retain their parent settings.
-At alpha=0 this mode recovers the parent training objective at that step.
+At a=0 this mode recovers the parent training objective at that step.
 
 The earlier `--poisson_objective elbo_alpha` mode remains available. Its
 minimized probabilistic loss is
 
 ```
 negative_L_alpha(x) = reconstruction_nll(x) + KL(q(z|x) || p(z))
-                     + alpha(step) * H(q(z|x)).
+                     + a(step) * H(q(z|x)).
 ```
 
 All terms are **summed over latent coordinates/groups, then averaged over
@@ -65,14 +69,14 @@ Let s=0,...,T-1 be the global minibatch/optimizer-step index and
 u=s/(T-1). Then
 
 ```
-alpha(u) = 0.05 * (1 + cos(pi*u/0.5))   if 0 <= u < 0.5
+a(u) = 0.05 * (1 + cos(pi*u/0.5))   if 0 <= u < 0.5
            0                            if u >= 0.5.
 ```
 
 The last step is exactly zero, including with anneal_portion=1. A one-step
 run also uses zero. For a 200-epoch run, the approximate milestones are:
 
-| Training progress | Approximate epoch | alpha |
+| Training progress | Approximate epoch | relative a |
 | --- | --- | --- |
 | 0% | start | 0.1 |
 | 12.5% | 25 | 0.085355 |
@@ -81,26 +85,30 @@ run also uses zero. For a 200-epoch run, the approximate milestones are:
 | 50% and later | 100-200 | 0 |
 
 This is a conservative experimental starting point, not a tuned optimum.
-In `elbo_alpha`, the explicit entropy coefficient in the maximized objective
-is 1-alpha=0.9 at initialization. This interpretation does not apply during
-the annealed/balanced phase of `nvae_alpha`. The separate entropy penalty can
-dominate a small initial KL weight, so monitor rates for excessive suppression;
-0.1 is an experimental setting, not a guarantee against rate collapse.
+In both modes, each group term can be written as
+`beta*w_g*(cross_entropy_g - (1-a)*H_g)`. With a=0.1, the entropy
+coefficient inside the brackets is -0.9. The added penalty is scaled down
+with the KL during warm-up, rather than imposed at full strength from the
+first step. This does not guarantee reconstruction improvement; a=0.1
+remains an experimental setting, and rate monitoring remains useful.
 Cosine decay has zero endpoint slopes, and the final half of training uses
 the chosen base objective with no added entropy penalty. No claim is
 made that this continuation reaches the same local optimum as training
 with alpha=0 from the beginning, or that it improves FID/NLL.
 
 The schedule is recomputed from the checkpoint's `global_step`. New
-checkpoints record its settings and total step count; resume rejects changed
+checkpoints record entropy_weighting=same_as_kl_v1 as well as its settings and total step count; resume rejects changed
 settings or changed total steps rather than silently restarting/re-timing
 annealing. Resume with the same arguments, including epochs and batch size.
 For `nvae_alpha`, checkpoint metadata also records all three KL schedule
 parameters and rejects changes on resume. Checkpoints from `elbo_alpha` cannot
 be resumed as `nvae_alpha`; start a fresh experiment to change objective.
-Older checkpoints without schedule metadata can be resumed using the current
-arguments and their saved global_step (the user is explicitly starting the
-new objective at that progress). A fresh run is recommended for comparison.
+Checkpoints with the old independent-entropy schedule metadata are rejected
+on resume because the loss semantics have changed. Start a fresh experiment;
+the launch script now uses the new save name
+`mnist_poisson_st_official_s2_t01_e200_nvae_sync_a01_cos50`.
+Older checkpoints without any schedule metadata can still use their saved
+global_step with the current arguments, as in the parent branch.
 As in the parent, the step counter advances on a GradScaler overflow even
 if that individual optimizer update is skipped.
 
@@ -113,15 +121,17 @@ if that individual optimizer update is skipped.
   pass sums the derivative of this series and saves only one tensor per
   rate array. Float16 entropy arithmetic is promoted to float32. The helper
   implements first derivatives, not higher-order differentiation.
+  Group entropies are retained separately and weighted by the same detached
+  w_g returned by the KL balancer; that balancer sees KL only, not KL+a*H.
   Ancestor gradients use the existing ST/relaxed path, so their usual bias
   and sampler truncation remain. With relaxed prefixes this is a surrogate
   for the discrete joint entropy, just as the original relaxed ELBO is a
   surrogate for the discrete objective.
 * **reinforce / obbvi:** use the full sampled joint entropy `-log q(z|x)`.
-  The score signal is `recon + (beta-alpha)*log_q - beta*log_p`, with the
+  The score signal is `recon + beta*(1-a)*log_q - beta*log_p`, with the
   original scheduled beta in `nvae_alpha` and beta=1 in `elbo_alpha`. The direct
   generative gradient is unchanged. The expectation of the omitted direct
-  `(beta-alpha)*grad(log_q)` is zero. O-BBVI applies the existing detached DMIS
+  `beta*(1-a)*grad(log_q)` is zero. O-BBVI applies the existing detached DMIS
   importance weights to the entire signal, including entropy. This handles
   entropy dependence on all ancestor groups. The EMA baseline tracks the
   regularized signal and is updated after all current samples.
@@ -213,8 +223,10 @@ bash scripts/train_mnist_poisson_entropy.sh --poisson_rate_monitor_every 200
   both entropy modes, excluding norm
   and optimizer weight penalties; do not interpret the score surrogate's
   raw scalar value as the loss.
-* `train/entropy_alpha`, `train/posterior_entropy_nats`,
-  `train/entropy_penalty_nats`: schedule and entropy diagnostics. Pathwise
+* `train/entropy_alpha` and `train/entropy_relative_a`: the relative a schedule.
+* `entropy_coeff/layer_g`: actual entropy coefficient beta*w_g*a for each group.
+* `train/posterior_entropy_nats`: unweighted joint entropy, for comparison.
+* `train/entropy_penalty_nats`: actual beta*a*sum_g w_g*H_g contribution. Pathwise
   entropy logging stops at alpha=0 to avoid extra computation; its penalty
   continues to log zero. Score paths can keep logging their sampled entropy.
 * Validation NELBO, importance-sampling NLL and generation retain the
@@ -231,9 +243,11 @@ independence, schedule endpoints, full hierarchical REINFORCE/O-BBVI
 gradients against enumerated expectations, model backward passes, and the
 actual training loop before/after the entropy penalty reaches zero.
 
-Implementation validation: 86 CPU tests passed on Python 3.12 / PyTorch 2.15,
+Implementation validation: 87 CPU tests passed on Python 3.12 / PyTorch 2.15,
 including zero-alpha loss/gradient/parameter-update equivalence with the
-parent-objective mode and annealed-beta hierarchical score gradients.
+parent-objective mode and beta-scaled hierarchical score gradients. Tests
+also check actual per-group entropy coefficients in the training loop,
+nonuniform weighted entropy values/gradients, and stopped weight gradients.
 The example script's 52 baseline settings were checked against the October
 16 log; CPU model construction confirms 33.363134M parameters and [10,5]
 groups. Changed Python files also parse with the Python 3.7 grammar. The
@@ -244,4 +258,5 @@ change in forward outputs, histogram mass and per-bin counts/fractions,
 first-batch and periodic training-loop logging without exports, and
 simulated unequal-batch distributed gathering.
 An actual TensorBoard SummaryWriter smoke check creates only event files.
+
 
