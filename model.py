@@ -149,6 +149,8 @@ class AutoEncoder(nn.Module):
         self._gradient_context = None
         self.collect_posterior_entropy = False
         self._posterior_entropy = None
+        self.collect_group1_rates = False
+        self.group1_posterior_rates = None
 
         self.num_latent_scales = args.num_latent_scales         # number of spatial scales that latent layers will reside
         self.num_groups_per_scale = args.num_groups_per_scale   # number of groups of latent vars. per scale
@@ -498,6 +500,7 @@ class AutoEncoder(nn.Module):
 
     def forward(self, x):
         self._posterior_entropy = None
+        self.group1_posterior_rates = None
         s = self.stem(2 * x - 1.0)
 
         # perform pre-processing
@@ -522,6 +525,8 @@ class AutoEncoder(nn.Module):
         ftr = self.enc0(s)                            # this reduces the channel dimension
         param0 = self.enc_sampler[idx_dec](ftr)
         dist = self._latent_from_param(idx_dec, param0)   # first approximate posterior
+        if self.collect_group1_rates and isinstance(dist, Poisson):
+            self.group1_posterior_rates = dist.rate.detach().float()
         z, proposal_log_probs = self._sample_latent(dist, training_sample=self.training)
         log_q_conv = dist.log_p(z)
 

@@ -135,8 +135,8 @@ def test_zero_alpha_preserves_score_surrogate():
 
 
 @pytest.mark.parametrize('estimator', ['relaxed', 'straight_through', 'reinforce', 'obbvi'])
-@pytest.mark.parametrize('step', [99, 1099])
-def test_training_loop_uses_full_kl_and_reports_unpenalized_elbo(monkeypatch, estimator, step):
+@pytest.mark.parametrize('step', [99, 499, 1099])
+def test_training_loop_uses_full_kl_and_reports_unpenalized_elbo(monkeypatch, tmp_path, estimator, step):
     # Load the actual training function without importing GPU/data/FID-only
     # entrypoint dependencies. Only CUDA transport and norm regularizers are
     # replaced; model, objective, optimizer and backward remain real.
@@ -145,6 +145,7 @@ def test_training_loop_uses_full_kl_and_reports_unpenalized_elbo(monkeypatch, es
     from pathlib import Path
     import numpy as np
     import utils
+    from rate_monitor import gather_group1_rates, write_rate_snapshot
     from test_mixed_model import _poisson_model
 
     tree = ast.parse((Path(__file__).resolve().parents[1] / 'train.py').read_text())
@@ -156,8 +157,11 @@ def test_training_loop_uses_full_kl_and_reports_unpenalized_elbo(monkeypatch, es
                            kl_const_coeff=.0001, num_total_iter=2001,
                            poisson_entropy_alpha_init=.1,
                            poisson_entropy_anneal_portion=.5,
+                           save=str(tmp_path),
                            weight_decay_norm_anneal=False, weight_decay_norm=0.)
     namespace = dict(torch=torch, np=np, utils=utils, args=args,
+                     gather_group1_rates=gather_group1_rates,
+                     write_rate_snapshot=write_rate_snapshot,
                      entropy_alpha=entropy_alpha, autocast=contextlib.nullcontext)
     exec(compile(tree, 'train.py', 'exec'), namespace)
     monkeypatch.setattr(torch.Tensor, 'cuda', lambda self, *a, **kw: self)
@@ -167,11 +171,17 @@ def test_training_loop_uses_full_kl_and_reports_unpenalized_elbo(monkeypatch, es
     optimizer = torch.optim.SGD(model.parameters(), lr=.00001)
     scaler = SimpleNamespace(scale=lambda loss: loss, step=lambda opt: opt.step(), update=lambda: None)
     logged = {}
-    writer = SimpleNamespace(add_scalar=lambda name, value, s: logged.update({name: float(value)}))
+    writer = SimpleNamespace(add_scalar=lambda name, value, s: logged.update({
+        name: float(value.detach() if isinstance(value, torch.Tensor) else value)}),
+        add_histogram=lambda *a, **kw: None)
     logger = SimpleNamespace(info=lambda *a: None)
     x = torch.bernoulli(torch.full((2, 1, 32, 32), .5))
     _, end_step = namespace['train']([(x, None)], model, optimizer, scaler, step, 0, writer, logger)
     assert end_step == step + 1
+    if step == 499:
+        snapshot = tmp_path / 'posterior_rate_monitor' / 'group_001' / 'step_000000500.npz'
+        with np.load(str(snapshot)) as data:
+            np.testing.assert_array_equal(data['rates'], model.group1_posterior_rates.numpy())
     assert logged['kl_coeff/coeff'] == 1.
     assert logged['train/entropy_alpha'] == entropy_alpha(step, 2001)
     assert logged['train/negative_elbo_alpha'] == pytest.approx(

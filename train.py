@@ -20,6 +20,7 @@ from thirdparty.adamax import Adamax
 import utils
 import datasets
 from entropy_regularization import entropy_alpha
+from rate_monitor import gather_group1_rates, write_rate_snapshot
 
 from fid.fid_score import compute_statistics_of_generator, load_statistics, calculate_frechet_distance
 from fid.inception import InceptionV3
@@ -30,6 +31,8 @@ def main(args):
                          args.poisson_objective == 'elbo_alpha')
     entropy_alpha(0, 2, args.poisson_entropy_alpha_init,
                   args.poisson_entropy_anneal_portion)  # validate before loading data
+    if args.poisson_rate_monitor_every < 0:
+        raise ValueError('poisson_rate_monitor_every must be nonnegative (0 disables).')
     # ensures that weight initializations are all the same
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -188,6 +191,10 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
             utils.average_params(model.parameters(), args.distributed)
 
         cnn_optimizer.zero_grad()
+        monitor_every = getattr(args, 'poisson_rate_monitor_every', 500)
+        monitor_rates = (model.latent_distribution == 'poisson' and monitor_every > 0 and
+                         (global_step == 0 or (global_step + 1) % monitor_every == 0))
+        model.collect_group1_rates = monitor_rates
         with autocast():
             kl_coeff = utils.kl_coeff(global_step, args.kl_anneal_portion * args.num_total_iter,
                                       args.kl_const_portion * args.num_total_iter, args.kl_const_coeff)
@@ -282,6 +289,13 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
 
             loss += norm_loss * wdn_coeff + bn_loss * wdn_coeff
 
+        if monitor_rates:
+            # All ranks enter the gather. Group 1 has no sampled ancestors,
+            # so repeated REINFORCE/O-BBVI draws have the same posterior rate.
+            rates = gather_group1_rates(model.group1_posterior_rates, args.distributed)
+            if rates is not None:
+                write_rate_snapshot(rates, args.save, global_step + 1, writer, logging)
+
         grad_scalar.scale(loss).backward()
         utils.average_gradients(model.parameters(), args.distributed)
         grad_scalar.step(cnn_optimizer)
@@ -351,6 +365,7 @@ def test(valid_queue, model, num_samples, args, logging):
     neg_log_p_avg = utils.AvgrageMeter()
     model.eval()
     model.collect_posterior_entropy = False
+    model.collect_group1_rates = False
     for step, x in enumerate(valid_queue):
         x = x[0] if len(x) > 1 else x
         x = x.cuda()
@@ -515,6 +530,8 @@ if __name__ == '__main__':
                         help='initial alpha in ELBO-alpha*H(q), in [0,1)')
     parser.add_argument('--poisson_entropy_anneal_portion', type=float, default=0.5,
                         help='fraction of optimizer-step span for cosine alpha decay to zero')
+    parser.add_argument('--poisson_rate_monitor_every', type=int, default=500,
+                        help='monitor group 1 posterior rates at first batch and every N steps; 0 disables')
     parser.add_argument('--reinforce_num_samples', type=int, default=1,
                         help='exact posterior samples per minibatch for REINFORCE')
     parser.add_argument('--score_baseline_decay', type=float, default=0.9,

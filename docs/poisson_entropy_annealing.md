@@ -128,6 +128,49 @@ against `--poisson_objective nvae` also changes KL warm-up/balancing.
 
 ## Diagnostics and validation
 
+### Group 1 posterior rate distribution during training
+
+`--poisson_rate_monitor_every 500` (default) captures the first training
+batch and every 500th batch thereafter. Set `0` to disable monitoring.
+Group 1 means the **first group in decoder/generative order**, i.e.
+`enc_sampler[0]` / internal group index 0, not the second group in zero-based
+indexing. The captured tensor is the posterior Poisson rate used for that
+forward pass, after rate parameterization/clamping, before sampling and the
+optimizer update. It is not a latent count or a prior parameter.
+
+Every image, channel and spatial coordinate in the current batch is included,
+with no averaging or subsampling. With distributed training, all ranks'
+current batches are gathered and rank zero writes one combined snapshot.
+These are current training-batch distributions, not full-dataset estimates;
+different snapshots generally contain different shuffled images.
+Repeated score-estimator samples do not duplicate the rates: group 1 has
+no stochastic ancestor, so its posterior rates are the same across these
+draws for the same batch.
+
+Outputs are under `<experiment>/posterior_rate_monitor/group_001/`:
+
+* `summary.csv`: step, number of images/rates, min/max, mean, population std,
+  and p01/p05/p25/p50/p75/p95/p99.
+* `step_XXXXXXXXX.png`: logarithmic rate bins versus the fraction of all
+  rates in each bin. Fixed bin edges allow comparisons over training.
+* `step_XXXXXXXXX_histogram.csv`: bin boundaries, counts and fractions.
+* `step_XXXXXXXXX.npz`: `rates` with shape `[global_B,C,H,W]`, `bin_edges`
+  and `counts`. Images are concatenated in rank order.
+
+TensorBoard contains the distribution under `posterior_rate/group_001` and
+scalar summaries under that prefix. The training log prints mean, standard
+deviation, min, p05, median, p95 and max at each monitoring step. Capture
+uses detached tensors and does not add a model forward pass. Gathering,
+CPU file writes and plotting add overhead only at the monitoring interval.
+
+For example, monitor every 200 steps:
+
+```bash
+bash scripts/train_mnist_poisson_entropy.sh --poisson_rate_monitor_every 200
+```
+
+### ELBO and entropy diagnostics
+
 * `train/nelbo_iter`, `train/nelbo`: unpenalized negative ELBO in the new mode.
 * `train/negative_elbo_alpha`: regularized probabilistic loss, excluding norm
   and optimizer weight penalties; do not interpret the score surrogate's
@@ -150,7 +193,10 @@ independence, schedule endpoints, full hierarchical REINFORCE/O-BBVI
 gradients against enumerated expectations, model backward passes, and the
 actual training loop before/after the entropy penalty reaches zero.
 
-Implementation validation: 39 tests passed on Python 3.12 / PyTorch 2.15
+Implementation validation: 46 tests passed on Python 3.12 / PyTorch 2.15
 CPU. Changed Python files also parse with the Python 3.7 grammar. The
 repository's original Python 3.7 / PyTorch 1.6 CUDA environment, distributed
 training, GPU mixed precision and full MNIST training have not been run here.
+Rate-monitor checks cover all four estimators, exact captured rates, no
+change in forward outputs, saved histogram mass/raw arrays, training-loop
+snapshot creation, and simulated unequal-batch distributed gathering.
