@@ -20,7 +20,7 @@ from thirdparty.adamax import Adamax
 import utils
 import datasets
 from entropy_regularization import entropy_alpha
-from rate_monitor import gather_group1_rates, write_rate_snapshot
+from rate_monitor import gather_group1_rates, log_rate_distribution
 
 from fid.fid_score import compute_statistics_of_generator, load_statistics, calculate_frechet_distance
 from fid.inception import InceptionV3
@@ -308,7 +308,7 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
             # so repeated REINFORCE/O-BBVI draws have the same posterior rate.
             rates = gather_group1_rates(model.group1_posterior_rates, args.distributed)
             if rates is not None:
-                write_rate_snapshot(rates, args.save, global_step + 1, writer, logging)
+                log_rate_distribution(rates, global_step + 1, writer, logging)
 
         grad_scalar.scale(loss).backward()
         utils.average_gradients(model.parameters(), args.distributed)

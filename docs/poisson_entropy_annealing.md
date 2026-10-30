@@ -171,28 +171,31 @@ optimizer update. It is not a latent count or a prior parameter.
 
 Every image, channel and spatial coordinate in the current batch is included,
 with no averaging or subsampling. With distributed training, all ranks'
-current batches are gathered and rank zero writes one combined snapshot.
+current batches are gathered and rank zero logs one combined distribution.
 These are current training-batch distributions, not full-dataset estimates;
-different snapshots generally contain different shuffled images.
+different monitoring batches generally contain different shuffled images.
 Repeated score-estimator samples do not duplicate the rates: group 1 has
 no stochastic ancestor, so its posterior rates are the same across these
 draws for the same batch.
 
-Outputs are under `<experiment>/posterior_rate_monitor/group_001/`:
+Monitoring writes **only to TensorBoard event files and the training log**;
+it does not export NPZ, CSV, PNG or a separate monitoring directory.
 
-* `summary.csv`: step, number of images/rates, min/max, mean, population std,
-  and p01/p05/p25/p50/p75/p95/p99.
-* `step_XXXXXXXXX.png`: logarithmic rate bins versus the fraction of all
-  rates in each bin. Fixed bin edges allow comparisons over training.
-* `step_XXXXXXXXX_histogram.csv`: bin boundaries, counts and fractions.
-* `step_XXXXXXXXX.npz`: `rates` with shape `[global_B,C,H,W]`, `bin_edges`
-  and `counts`. Images are concatenated in rank order.
+* TensorBoard: `posterior_rate/group_001` shows the histogram/distribution.
+  Summary scalars under that prefix include image/rate counts, mean,
+  population standard deviation, min/max, and p01/p05/p25/p50/p75/p95/p99.
+* Bins: 60 fixed logarithmic intervals from 0.001 to 1000. TensorBoard scalars
+  `posterior_rate/group_001/bins/<index>_<left>_to_<right>/count` and `/fraction`
+  record the count and fraction of all rates in every bin, including empty
+  bins. Fractions sum to one; they are not densities per unit rate.
+* Training log: one `group1 posterior rate summary` line contains all summary
+  statistics, followed by 60 `group1 posterior rate bin` lines with interval
+  boundaries, counts and fractions. Intervals are [left,right), except the
+  last interval which includes the right boundary.
 
-TensorBoard contains the distribution under `posterior_rate/group_001` and
-scalar summaries under that prefix. The training log prints mean, standard
-deviation, min, p05, median, p95 and max at each monitoring step. Capture
-uses detached tensors and does not add a model forward pass. Gathering,
-CPU file writes and plotting add overhead only at the monitoring interval.
+Capture uses detached tensors and does not add a forward pass or consume RNG
+state. Training gradients are unchanged. Monitoring performs a CPU transfer
+and, with DDP, a gather.
 
 For example, monitor every 200 steps:
 
@@ -228,7 +231,7 @@ independence, schedule endpoints, full hierarchical REINFORCE/O-BBVI
 gradients against enumerated expectations, model backward passes, and the
 actual training loop before/after the entropy penalty reaches zero.
 
-Implementation validation: 78 CPU tests passed on Python 3.12 / PyTorch 2.15,
+Implementation validation: 86 CPU tests passed on Python 3.12 / PyTorch 2.15,
 including zero-alpha loss/gradient/parameter-update equivalence with the
 parent-objective mode and annealed-beta hierarchical score gradients.
 The example script's 52 baseline settings were checked against the October
@@ -237,6 +240,8 @@ groups. Changed Python files also parse with the Python 3.7 grammar. The
 repository's original Python 3.7 / PyTorch 1.6 CUDA environment, distributed
 training, GPU mixed precision and full MNIST training have not been run here.
 Rate-monitor checks cover all four estimators, exact captured rates, no
-change in forward outputs, saved histogram mass/raw arrays, training-loop
-snapshot creation, and simulated unequal-batch distributed gathering.
+change in forward outputs, histogram mass and per-bin counts/fractions,
+first-batch and periodic training-loop logging without exports, and
+simulated unequal-batch distributed gathering.
+An actual TensorBoard SummaryWriter smoke check creates only event files.
 

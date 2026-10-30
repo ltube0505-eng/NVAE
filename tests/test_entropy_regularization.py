@@ -136,7 +136,7 @@ def test_zero_alpha_preserves_score_surrogate():
 
 
 @pytest.mark.parametrize('estimator', ['relaxed', 'straight_through', 'reinforce', 'obbvi'])
-@pytest.mark.parametrize('step', [99, 499, 1099])
+@pytest.mark.parametrize('step', [0, 99, 499, 1099])
 @pytest.mark.parametrize('objective', ['elbo_alpha', 'nvae_alpha'])
 def test_training_loop_kl_policy_and_entropy(monkeypatch, tmp_path, estimator, step, objective):
     # Load the actual training function without importing GPU/data/FID-only
@@ -147,7 +147,7 @@ def test_training_loop_kl_policy_and_entropy(monkeypatch, tmp_path, estimator, s
     from pathlib import Path
     import numpy as np
     import utils
-    from rate_monitor import gather_group1_rates, write_rate_snapshot
+    from rate_monitor import gather_group1_rates, log_rate_distribution
     from test_mixed_model import _poisson_model
 
     tree = ast.parse((Path(__file__).resolve().parents[1] / 'train.py').read_text())
@@ -163,7 +163,7 @@ def test_training_loop_kl_policy_and_entropy(monkeypatch, tmp_path, estimator, s
                            weight_decay_norm_anneal=False, weight_decay_norm=0.)
     namespace = dict(torch=torch, np=np, utils=utils, args=args,
                      gather_group1_rates=gather_group1_rates,
-                     write_rate_snapshot=write_rate_snapshot,
+                     log_rate_distribution=log_rate_distribution,
                      entropy_alpha=entropy_alpha, autocast=contextlib.nullcontext)
     exec(compile(tree, 'train.py', 'exec'), namespace)
     monkeypatch.setattr(torch.Tensor, 'cuda', lambda self, *a, **kw: self)
@@ -173,9 +173,10 @@ def test_training_loop_kl_policy_and_entropy(monkeypatch, tmp_path, estimator, s
     optimizer = torch.optim.SGD(model.parameters(), lr=.00001)
     scaler = SimpleNamespace(scale=lambda loss: loss, step=lambda opt: opt.step(), update=lambda: None)
     logged = {}
+    histograms = []
     writer = SimpleNamespace(add_scalar=lambda name, value, s: logged.update({
         name: float(value.detach() if isinstance(value, torch.Tensor) else value)}),
-        add_histogram=lambda *a, **kw: None)
+        add_histogram=lambda *a, **kw: histograms.append((a, kw)))
     logger = SimpleNamespace(info=lambda *a: None)
     x = torch.bernoulli(torch.full((2, 1, 32, 32), .5))
     original_balancer = utils.kl_balancer
@@ -189,10 +190,17 @@ def test_training_loop_kl_policy_and_entropy(monkeypatch, tmp_path, estimator, s
     monkeypatch.setattr(utils, 'kl_balancer', record_balance)
     _, end_step = namespace['train']([(x, None)], model, optimizer, scaler, step, 0, writer, logger)
     assert end_step == step + 1
-    if step == 499:
-        snapshot = tmp_path / 'posterior_rate_monitor' / 'group_001' / 'step_000000500.npz'
-        with np.load(str(snapshot)) as data:
-            np.testing.assert_array_equal(data['rates'], model.group1_posterior_rates.numpy())
+    assert list(tmp_path.iterdir()) == []
+    if step in (0, 499):
+        assert len(histograms) == 1
+        assert histograms[0][0][2] == step + 1
+        np.testing.assert_array_equal(histograms[0][0][1],
+                                      model.group1_posterior_rates.numpy().reshape(-1))
+    else:
+        assert histograms == []
+    if step == 0:
+        assert logged['posterior_rate/group_001/num_rates'] == model.group1_posterior_rates.numel()
+        return  # The parent's loss diagnostics are written only every 100 steps.
     expected_beta = (1. if objective == 'elbo_alpha' else
                      utils.kl_coeff(step, .3 * 2001, .0001 * 2001, .0001))
     assert logged['kl_coeff/coeff'] == expected_beta
