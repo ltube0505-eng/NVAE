@@ -30,7 +30,8 @@ def main(args):
     entropy_objective = (args.latent_distribution == 'poisson' and
                          args.poisson_objective in {'elbo_alpha', 'nvae_alpha'})
     entropy_alpha(0, 2, args.poisson_entropy_alpha_init,
-                  args.poisson_entropy_anneal_portion)  # validate before loading data
+                  args.poisson_entropy_anneal_portion,
+                  args.poisson_entropy_anneal_start_portion)  # validate before loading data
     if args.poisson_rate_monitor_every < 0:
         raise ValueError('poisson_rate_monitor_every must be nonnegative (0 disables).')
     # ensures that weight initializations are all the same
@@ -57,10 +58,11 @@ def main(args):
     logging.info('param size = %fM ', utils.count_parameters_in_M(model))
     logging.info('groups per scale: %s, total_groups: %d', model.groups_per_scale, sum(model.groups_per_scale))
     if entropy_objective:
-        logging.info('Poisson entropy objective %s: relative a %.6g -> 0 '
-                     'with cosine decay over %.1f%% of optimizer steps; '
+        logging.info('Poisson entropy objective %s: hold relative a %.6g, '
+                     'cosine decay from %.1f%% to %.1f%% of optimizer steps; '
                      'existing weight/norm regularizers remain separate.',
                      args.poisson_objective, args.poisson_entropy_alpha_init,
+                     100. * args.poisson_entropy_anneal_start_portion,
                      100. * args.poisson_entropy_anneal_portion)
         logging.info('Entropy penalty = beta * a * sum_g stop_gradient(w_g) * H_g; '
                      'same beta and group weights as KL.')
@@ -172,6 +174,7 @@ def entropy_schedule_config(args):
     config = dict(objective=args.poisson_objective,
                   entropy_weighting='same_as_kl_v1',
                   initial=args.poisson_entropy_alpha_init,
+                  start_portion=args.poisson_entropy_anneal_start_portion,
                   anneal_portion=args.poisson_entropy_anneal_portion,
                   total_steps=args.num_total_iter)
     if args.poisson_objective == 'nvae_alpha':
@@ -221,7 +224,8 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
                 kl_coeff = 1.
             entropy_coeff = entropy_alpha(
                 global_step, args.num_total_iter, args.poisson_entropy_alpha_init,
-                args.poisson_entropy_anneal_portion) if entropy_objective else 0.
+                args.poisson_entropy_anneal_portion,
+                args.poisson_entropy_anneal_start_portion) if entropy_objective else 0.
             score_estimator = model.poisson_gradient_estimator in {'reinforce', 'obbvi'}
             model.collect_posterior_entropy = entropy_coeff > 0. and not score_estimator
             entropy_batch = None
@@ -560,7 +564,9 @@ if __name__ == '__main__':
     parser.add_argument('--poisson_entropy_alpha_init', type=float, default=0.1,
                         help='initial relative a in beta*sum_g w_g*(KL_g+a*H_g), in [0,1)')
     parser.add_argument('--poisson_entropy_anneal_portion', type=float, default=0.5,
-                        help='fraction of optimizer-step span for cosine alpha decay to zero')
+                        help='training progress at which relative a reaches zero (decay end)')
+    parser.add_argument('--poisson_entropy_anneal_start_portion', type=float, default=0.2,
+                        help='training progress at which cosine decay starts; hold initial a before this')
     parser.add_argument('--poisson_rate_monitor_every', type=int, default=500,
                         help='monitor group 1 posterior rates at first batch and every N steps; 0 disables')
     parser.add_argument('--reinforce_num_samples', type=int, default=1,

@@ -9,7 +9,7 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
 python -u train.py \
   --root /root/autodl-tmp/nvae-checkpoints \
-  --save mnist_poisson_st_official_s2_t01_e200_nvae_sync_a01_cos50 \
+  --save mnist_poisson_st_official_s2_t01_e200_nvae_sync_a01_hold20_cos50 \
   --dataset mnist \
   --data /root/autodl-tmp/datasets/mnist \
   --arch_instance res_mbconv \
@@ -20,6 +20,7 @@ python -u train.py \
   --poisson_max_rate 30 \
   --poisson_objective nvae_alpha \
   --poisson_entropy_alpha_init 0.1 \
+  --poisson_entropy_anneal_start_portion 0.2 \
   --poisson_entropy_anneal_portion 0.5 \
   --poisson_rate_monitor_every 500 \
   --kl_anneal_portion 0.3 \

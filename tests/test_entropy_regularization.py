@@ -13,13 +13,16 @@ from model import AutoEncoder
 def test_schedule_endpoints_monotonicity_and_resume():
     values = [entropy_alpha(s, 1001) for s in range(1001)]
     assert values[0] == 0.1
-    assert values[250] == pytest.approx(0.05)
+    assert all(v == .1 for v in values[:201])
+    assert values[350] == pytest.approx(0.05)
+    assert values[250] == pytest.approx(.05 * (1. + math.cos(math.pi / 6.)))
     assert all(a >= b for a, b in zip(values, values[1:]))
     assert all(v == 0. for v in values[500:])
     assert [entropy_alpha(s, 1001) for s in range(321, 1001)] == values[321:]
     assert entropy_alpha(1000, 1001, anneal_portion=1.) == 0.
     assert entropy_alpha(0, 1) == 0.
     assert entropy_alpha(0, 1001, initial=0.) == 0.
+    assert entropy_alpha(250, 1001, start_portion=0.) == pytest.approx(.05)
 
 
 @pytest.mark.parametrize('initial,portion', [(-0.1, .5), (1., .5), (float('nan'), .5),
@@ -27,6 +30,12 @@ def test_schedule_endpoints_monotonicity_and_resume():
 def test_invalid_schedule_rejected(initial, portion):
     with pytest.raises(ValueError):
         entropy_alpha(0, 100, initial, portion)
+
+
+@pytest.mark.parametrize('start', [-.1, .5, .6, float('nan')])
+def test_invalid_decay_start_rejected(start):
+    with pytest.raises(ValueError):
+        entropy_alpha(0, 1001, start_portion=start)
 
 
 def test_entropy_series_and_gradient_against_long_support():
@@ -176,6 +185,7 @@ def test_training_loop_kl_policy_and_entropy(monkeypatch, tmp_path, estimator, s
                            kl_const_coeff=.0001, num_total_iter=2001,
                            poisson_entropy_alpha_init=.1,
                            poisson_entropy_anneal_portion=.5,
+                           poisson_entropy_anneal_start_portion=.2,
                            save=str(tmp_path),
                            weight_decay_norm_anneal=False, weight_decay_norm=0.)
     namespace = dict(torch=torch, np=np, utils=utils, args=args,
@@ -271,6 +281,7 @@ def test_zero_entropy_recovers_parent_loss_and_gradients(monkeypatch, estimator,
                            kl_anneal_portion=.3, kl_const_portion=.0001,
                            kl_const_coeff=.0001, num_total_iter=2001,
                            poisson_entropy_alpha_init=0., poisson_entropy_anneal_portion=.5,
+                           poisson_entropy_anneal_start_portion=.2,
                            poisson_rate_monitor_every=0,
                            weight_decay_norm_anneal=True, weight_decay_norm=.01,
                            weight_decay_norm_init=10.)

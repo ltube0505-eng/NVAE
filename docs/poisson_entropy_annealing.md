@@ -62,6 +62,7 @@ new joint discrete-entropy mode applies only to `--latent_distribution poisson`.
 
 ```
 --poisson_entropy_alpha_init 0.1
+--poisson_entropy_anneal_start_portion 0.2
 --poisson_entropy_anneal_portion 0.5
 ```
 
@@ -69,19 +70,23 @@ Let s=0,...,T-1 be the global minibatch/optimizer-step index and
 u=s/(T-1). Then
 
 ```
-a(u) = 0.05 * (1 + cos(pi*u/0.5))   if 0 <= u < 0.5
-           0                            if u >= 0.5.
+a(u) = 0.1                                 if 0 <= u <= 0.2
+       0.05 * (1 + cos(pi*(u-0.2)/0.3))    if 0.2 < u < 0.5
+       0                                   if u >= 0.5.
 ```
 
+The first 20% holds a=0.1; cosine decay runs from 20% to 50%.
+`anneal_start_portion` is the start progress and `anneal_portion` is the
+end progress, not a decay duration. Set start to 0 to reproduce the former
+0%-50% schedule. Require 0 <= start < end <= 1.
 The last step is exactly zero, including with anneal_portion=1. A one-step
 run also uses zero. For a 200-epoch run, the approximate milestones are:
 
 | Training progress | Approximate epoch | relative a |
 | --- | --- | --- |
 | 0% | start | 0.1 |
-| 12.5% | 25 | 0.085355 |
-| 25% | 50 | 0.05 |
-| 37.5% | 75 | 0.014645 |
+| 20% | 40 | 0.1 (decay starts) |
+| 35% | 70 | 0.05 |
 | 50% and later | 100-200 | 0 |
 
 This is a conservative experimental starting point, not a tuned optimum.
@@ -104,9 +109,11 @@ For `nvae_alpha`, checkpoint metadata also records all three KL schedule
 parameters and rejects changes on resume. Checkpoints from `elbo_alpha` cannot
 be resumed as `nvae_alpha`; start a fresh experiment to change objective.
 Checkpoints with the old independent-entropy schedule metadata are rejected
-on resume because the loss semantics have changed. Start a fresh experiment;
+on resume because the loss semantics have changed. A checkpoint from the
+previous schedule without a recorded start_portion is also rejected by
+the schedule comparison; use a fresh save directory for this 20%-50% run. Start a fresh experiment;
 the launch script now uses the new save name
-`mnist_poisson_st_official_s2_t01_e200_nvae_sync_a01_cos50`.
+`mnist_poisson_st_official_s2_t01_e200_nvae_sync_a01_hold20_cos50`.
 Older checkpoints without any schedule metadata can still use their saved
 global_step with the current arguments, as in the parent branch.
 As in the parent, the step counter advances on a GradScaler overflow even
@@ -243,11 +250,13 @@ independence, schedule endpoints, full hierarchical REINFORCE/O-BBVI
 gradients against enumerated expectations, model backward passes, and the
 actual training loop before/after the entropy penalty reaches zero.
 
-Implementation validation: 87 CPU tests passed on Python 3.12 / PyTorch 2.15,
+Implementation validation: 91 CPU tests passed on Python 3.12 / PyTorch 2.15,
 including zero-alpha loss/gradient/parameter-update equivalence with the
 parent-objective mode and beta-scaled hierarchical score gradients. Tests
 also check actual per-group entropy coefficients in the training loop,
-nonuniform weighted entropy values/gradients, and stopped weight gradients.
+nonuniform weighted entropy values/gradients, stopped weight gradients,
+the initial hold, start/midpoint/end values, resumed schedule continuity,
+and invalid start/end settings.
 The example script's 52 baseline settings were checked against the October
 16 log; CPU model construction confirms 33.363134M parameters and [10,5]
 groups. Changed Python files also parse with the Python 3.7 grammar. The
