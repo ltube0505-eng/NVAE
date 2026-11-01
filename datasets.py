@@ -217,12 +217,12 @@ def get_loaders_eval(dataset, args):
     train_queue = torch.utils.data.DataLoader(
         train_data, batch_size=args.batch_size,
         shuffle=(train_sampler is None),
-        sampler=train_sampler, pin_memory=True, num_workers=8, drop_last=True)
+        sampler=train_sampler, pin_memory=True, num_workers=0 if getattr(args, 'device', 'cuda') == 'cpu' else 8, drop_last=True)
 
     valid_queue = torch.utils.data.DataLoader(
         valid_data, batch_size=args.batch_size,
         shuffle=(valid_sampler is None),
-        sampler=valid_sampler, pin_memory=True, num_workers=1, drop_last=False)
+        sampler=valid_sampler, pin_memory=True, num_workers=0 if getattr(args, 'device', 'cuda') == 'cpu' else 1, drop_last=False)
 
     return train_queue, valid_queue, num_classes
 

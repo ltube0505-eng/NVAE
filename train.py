@@ -43,7 +43,7 @@ def main(args):
     arch_instance = utils.get_arch_cells(args.arch_instance)
 
     model = AutoEncoder(args, writer, arch_instance)
-    model = model.cuda()
+    model = model.to(args.device)
 
     logging.info('args = %s', args)
     logging.info('param size = %fM ', utils.count_parameters_in_M(model))
@@ -58,8 +58,8 @@ def main(args):
                                            weight_decay=args.weight_decay, eps=1e-3)
 
     cnn_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        cnn_optimizer, float(args.epochs - args.warmup_epochs - 1), eta_min=args.learning_rate_min)
-    grad_scalar = GradScaler(2**10)
+        cnn_optimizer, float(max(1, args.epochs - args.warmup_epochs - 1)), eta_min=args.learning_rate_min)
+    grad_scalar = GradScaler(2**10, enabled=args.device == 'cuda' and not model.group1_svi_steps)
 
     num_output = utils.num_output(args.dataset)
     bpd_coeff = 1. / np.log(2.) / num_output
@@ -71,7 +71,7 @@ def main(args):
         checkpoint = torch.load(checkpoint_file, map_location='cpu')
         init_epoch = checkpoint['epoch']
         model.load_state_dict(checkpoint['state_dict'])
-        model = model.cuda()
+        model = model.to(args.device)
         cnn_optimizer.load_state_dict(checkpoint['optimizer'])
         grad_scalar.load_state_dict(checkpoint['grad_scalar'])
         cnn_scheduler.load_state_dict(checkpoint['scheduler'])
@@ -110,7 +110,7 @@ def main(args):
                     output_tiled = utils.tile_image(output_img, n)
                     writer.add_image('generated_%0.1f' % t, output_tiled, global_step)
 
-            valid_neg_log_p, valid_nelbo = test(valid_queue, model, num_samples=10, args=args, logging=logging)
+            valid_neg_log_p, valid_nelbo = test(valid_queue, model, num_samples=args.num_eval_samples, args=args, logging=logging)
             logging.info('valid_nelbo %f', valid_nelbo)
             logging.info('valid neg log p %f', valid_neg_log_p)
             logging.info('valid bpd elbo %f', valid_nelbo * bpd_coeff)
@@ -130,7 +130,7 @@ def main(args):
                             'grad_scalar': grad_scalar.state_dict()}, checkpoint_file)
 
     # Final validation
-    valid_neg_log_p, valid_nelbo = test(valid_queue, model, num_samples=1000, args=args, logging=logging)
+    valid_neg_log_p, valid_nelbo = test(valid_queue, model, num_samples=args.final_eval_samples, args=args, logging=logging)
     logging.info('final valid nelbo %f', valid_nelbo)
     logging.info('final valid neg log p %f', valid_neg_log_p)
     writer.add_scalar('val/neg_log_p', valid_neg_log_p, epoch + 1)
@@ -142,12 +142,15 @@ def main(args):
 
 def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_iters, writer, logging):
     alpha_i = utils.kl_balancer_coeff(num_scales=model.num_latent_scales,
-                                      groups_per_scale=model.groups_per_scale, fun='square')
+                                      groups_per_scale=model.groups_per_scale, fun='square',
+                                      device=next(model.parameters()).device)
     nelbo = utils.AvgrageMeter()
     model.train()
     for step, x in enumerate(train_queue):
+        if args.max_train_batches and step >= args.max_train_batches:
+            break
         x = x[0] if len(x) > 1 else x
-        x = x.cuda()
+        x = x.to(next(model.parameters()).device)
 
         # change bit length
         x = utils.pre_process(x, args.num_x_bits)
@@ -163,7 +166,7 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
             utils.average_params(model.parameters(), args.distributed)
 
         cnn_optimizer.zero_grad()
-        with autocast():
+        with autocast(enabled=args.device == 'cuda' and not model.group1_svi_steps):
             kl_coeff = utils.kl_coeff(global_step, args.kl_anneal_portion * args.num_total_iter,
                                       args.kl_const_portion * args.num_total_iter, args.kl_const_coeff)
             score_estimator = model.poisson_gradient_estimator in {'reinforce', 'obbvi'}
@@ -241,7 +244,8 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
         grad_scalar.update()
         nelbo.update(reported_nelbo.data, 1)
 
-        if (global_step + 1) % 100 == 0:
+        if (global_step + 1) % 100 == 0 or (model.group1_svi_steps and (step == 0 or
+                (args.max_train_batches and step + 1 == args.max_train_batches))):
             if (global_step + 1) % 1000 == 0:  # reduced frequency
                 n = int(np.floor(np.sqrt(x.size(0))))
                 x_img = x[:n*n]
@@ -263,6 +267,11 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
             writer.add_scalar('train/lr', cnn_optimizer.state_dict()[
                               'param_groups'][0]['lr'], global_step)
             writer.add_scalar('train/nelbo_iter', reported_nelbo, global_step)
+            if model.group1_svi_steps:
+                writer.add_scalar('train/refined_nelbo',
+                                  (recon_loss + sum(kl_all)).mean(), global_step)
+                for name, value in model.group1_svi_stats.items():
+                    writer.add_scalar('group1_svi/' + name, value, global_step)
             writer.add_scalar('train/kl_iter', torch.mean(sum(kl_all)), global_step)
             writer.add_scalar('train/recon_iter', torch.mean(recon_loss), global_step)
             writer.add_scalar('kl_coeff/coeff', kl_coeff, global_step)
@@ -293,8 +302,10 @@ def test(valid_queue, model, num_samples, args, logging):
     neg_log_p_avg = utils.AvgrageMeter()
     model.eval()
     for step, x in enumerate(valid_queue):
+        if getattr(args, 'max_valid_batches', 0) and step >= args.max_valid_batches:
+            break
         x = x[0] if len(x) > 1 else x
-        x = x.cuda()
+        x = x.to(next(model.parameters()).device)
 
         # change bit length
         x = utils.pre_process(x, args.num_x_bits)
@@ -368,9 +379,11 @@ def test_vae_fid(model, args, total_fid_samples):
 def init_processes(rank, size, fn, args):
     """ Initialize the distributed environment. """
     os.environ['MASTER_ADDR'] = args.master_address
-    os.environ['MASTER_PORT'] = '6020'
-    torch.cuda.set_device(args.local_rank)
-    dist.init_process_group(backend='nccl', init_method='env://', rank=rank, world_size=size)
+    os.environ.setdefault('MASTER_PORT', '6020')
+    if getattr(args, 'device', 'cuda') == 'cuda':
+        torch.cuda.set_device(args.local_rank)
+    backend = 'nccl' if getattr(args, 'device', 'cuda') == 'cuda' else 'gloo'
+    dist.init_process_group(backend=backend, init_method='env://', rank=rank, world_size=size)
     fn(args)
     cleanup()
 
@@ -386,6 +399,12 @@ if __name__ == '__main__':
                         help='location of the results')
     parser.add_argument('--save', type=str, default='exp',
                         help='id used for storing intermediate results')
+    parser.add_argument('--device', choices=['cuda', 'cpu'], default='cuda')
+    parser.add_argument('--max_train_batches', type=int, default=0,
+                        help='0 uses the full loader; positive values bound smoke training.')
+    parser.add_argument('--max_valid_batches', type=int, default=0)
+    parser.add_argument('--num_eval_samples', type=int, default=10)
+    parser.add_argument('--final_eval_samples', type=int, default=1000)
     # data
     parser.add_argument('--dataset', type=str, default='mnist',
                         choices=['cifar10', 'mnist', 'omniglot', 'celeba_64', 'celeba_256',
@@ -443,6 +462,12 @@ if __name__ == '__main__':
     parser.add_argument('--poisson_gradient_estimator', type=str, default='straight_through',
                         choices=['relaxed', 'reinforce', 'obbvi', 'straight_through'],
                         help='gradient estimator used by Poisson latent groups')
+    parser.add_argument('--group1_svi_steps', type=int, default=0,
+                        help='Local momentum steps for only the top scale first group; 0 disables.')
+    parser.add_argument('--group1_svi_lr', type=float, default=0.1)
+    parser.add_argument('--group1_svi_momentum', type=float, default=0.5)
+    parser.add_argument('--group1_svi_eps', type=float, default=1e-5,
+                        help='SA-VAE forward-difference HVP epsilon; uses full precision.')
     parser.add_argument('--poisson_relaxation_temperature', type=float, default=0.1,
                         help='sigmoid temperature for relaxed/ST Poisson arrival indicators')
     parser.add_argument('--poisson_max_count', type=int, default=64,
@@ -504,12 +529,23 @@ if __name__ == '__main__':
     parser.add_argument('--seed', type=int, default=1,
                         help='seed used for initialization')
     args = parser.parse_args()
+    if args.device == 'cpu' and args.arch_instance != 'res_elu':
+        parser.error('CPU training currently requires --arch_instance res_elu (no CUDA SyncBN).')
+    if args.max_train_batches < 0 or args.max_valid_batches < 0:
+        parser.error('Batch limits must be nonnegative.')
+    if args.num_eval_samples < 1 or args.final_eval_samples < 1:
+        parser.error('Evaluation sample counts must be positive.')
     args.save = args.root + '/eval-' + args.save
     utils.create_exp_dir(args.save)
 
     size = args.num_process_per_node
 
-    if size > 1:
+    if args.device == 'cpu':
+        if size != 1:
+            parser.error('CPU smoke training supports one process.')
+        args.distributed = False
+        main(args)
+    elif size > 1:
         args.distributed = True
         processes = []
         for rank in range(size):

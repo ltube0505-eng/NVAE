@@ -103,8 +103,8 @@ class Conv2D(nn.Conv2d):
                 st = 5 * torch.std(out, dim=[0, 2, 3])
 
                 # get mn and st from other GPUs
-                average_tensor(mn, is_distributed=True)
-                average_tensor(st, is_distributed=True)
+                average_tensor(mn, is_distributed=torch.distributed.is_initialized())
+                average_tensor(st, is_distributed=torch.distributed.is_initialized())
 
                 if self.bias is not None:
                     self.bias.data = - mn / (st + 1e-5)
