@@ -95,8 +95,7 @@ sampling path; no model `.grad` is accumulated in validation.
 
 ```bash
 conda activate nvae
-cd /root/autodl-tmp/NVAE
-# Use the actual checkout directory if it has a different name.
+cd /root/autodl-tmp/NVAE-poisson-group1-svi
 git fetch origin
 git switch feature/poisson-group1-semi-amortized
 git pull --ff-only origin feature/poisson-group1-semi-amortized
@@ -109,8 +108,26 @@ CUDA_VISIBLE_DEVICES=0 MASTER_PORT=6031 bash scripts/train_mnist_poisson_group1_
 
 Run inside `screen -S nvae_group1_svi` for a persistent remote terminal. The
 launcher defaults to MNIST, 200 epochs, batch 64, 16 channels, 8 latent channels
-per group, Poisson ST temperature 0.1, and the base NVAE KL schedule. This is a
-small topology configuration, not the previous official large-run configuration.
+per group, Poisson ST temperature 0.1, and the base NVAE KL schedule. The base
+training hyperparameters match the supplied 2026-09-23 run:
+
+| Option | Value |
+|---|---|
+| `use_se`, `res_dist` | `True`, `True` |
+| `min_groups_per_scale` | 1 (encoder groups still `[4,2]`) |
+| `weight_decay`, `weight_decay_norm` | 0.0003, 0.0 |
+| `weight_decay_norm_anneal`, `weight_decay_norm_init` | `False`, 10.0 |
+| `fast_adamax`, `cont_training` | `False`, `False` |
+| `num_mixture_dec`, `num_x_bits`, `seed` | 10, 8, 1 |
+| KL anneal / constant portion / constant coefficient | 0.3 / 0.0001 / 0.0001 |
+
+The model has 2,104,790 trainable parameters (2.104790M); local refinement adds
+no learned parameters. With the same 60,000-image MNIST train loader and one
+GPU, batch 64 gives 937 batches per epoch and 187,400 total optimizer steps.
+`num_total_iter` is computed from the loader; it is not a CLI argument.
+The new save name prevents reuse of the baseline run's output directory. The
+SVI-specific options and full-precision execution are additional to that baseline;
+all pre-existing training options above follow the supplied configuration.
 
 | Decoder scale | Spatial size | Groups | Locally optimized groups |
 |---|---|---|---|

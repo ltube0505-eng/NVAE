@@ -1,6 +1,11 @@
 # Recorded MNIST CPU training smoke run
 
 This is a bounded integration run, **not** a full 200-epoch training result.
+It was recorded at commit `9db9f4efc25dbc1df340c8173b9ce13f9e1dd34d`, using
+that commit's launcher defaults (`use_se=False`, `res_dist=False`,
+`min_groups_per_scale=2`, `weight_decay_norm=0.01`). The current launcher has
+since been aligned to the supplied baseline. The command below documents the
+historical run and should be interpreted with the launcher at that commit.
 The host has no CUDA device. Python 3.12.14, PyTorch 2.15.0+cu132 (CPU execution).
 The original Python 3.7 / PyTorch 1.6 CUDA environment and multi-GPU SyncBN path
 have not been executed here; the implementation retains their APIs.
