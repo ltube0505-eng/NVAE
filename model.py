@@ -16,7 +16,9 @@ from neural_ar_operations import ARConv2d, ARInvertedResidual, MixLogCDFParam, m
 from neural_ar_operations import ELUConv as ARELUConv
 from torch.distributions.bernoulli import Bernoulli
 
-from utils import get_stride_for_cell_type, get_input_size, groups_per_scale
+from utils import get_stride_for_cell_type, get_input_size, groups_per_scale, reconstruction_loss
+from group1_svi import (refine_momentum, temporary_model_state,
+                        batchnorm_snapshot, fixed_batchnorm)
 from distributions import Normal, Poisson, Gamma, DiscMixLogistic, NormalDecoder
 from thirdparty.inplaced_sync_batchnorm import SyncBatchNormSwish
 
@@ -147,6 +149,18 @@ class AutoEncoder(nn.Module):
         self._score_baseline_value = None
         self._obbvi_component = 0
         self._gradient_context = None
+
+        self.group1_svi_steps = int(getattr(args, 'group1_svi_steps', 0))
+        self.group1_svi_lr = float(getattr(args, 'group1_svi_lr', 0.1))
+        self.group1_svi_momentum = float(getattr(args, 'group1_svi_momentum', 0.5))
+        self.group1_svi_eps = float(getattr(args, 'group1_svi_eps', 1e-5))
+        if self.group1_svi_steps < 0 or self.group1_svi_lr <= 0 or \
+                not 0 <= self.group1_svi_momentum < 1 or self.group1_svi_eps <= 0:
+            raise ValueError('Invalid group1 SVI steps/lr/momentum/eps.')
+        if self.group1_svi_steps and (self.latent_distribution != 'poisson' or
+                self.poisson_gradient_estimator not in {'straight_through', 'relaxed'}):
+            raise ValueError('Group1 SVI requires Poisson ST or relaxed gradients.')
+        self.group1_svi_stats = {}
 
         self.num_latent_scales = args.num_latent_scales         # number of spatial scales that latent layers will reside
         self.num_groups_per_scale = args.num_groups_per_scale   # number of groups of latent vars. per scale
@@ -477,7 +491,7 @@ class AutoEncoder(nn.Module):
         inference = importance_weight * centered_signal * log_q
         return generative + inference, sampled_nelbo.detach(), importance_weight
 
-    def forward(self, x):
+    def _encode(self, x):
         s = self.stem(2 * x - 1.0)
 
         # perform pre-processing
@@ -498,11 +512,55 @@ class AutoEncoder(nn.Module):
         combiner_cells_enc.reverse()
         combiner_cells_s.reverse()
 
+        ftr = self.enc0(s)
+        param0 = self.enc_sampler[0](ftr)
+        return param0, ftr, combiner_cells_enc, combiner_cells_s
+
+    def forward(self, x):
+        if not self.group1_svi_steps:
+            return self._decode(*self._encode(x))
+        # Finite differences must not be evaluated in fp16 or with AMP loss scaling.
+        with torch.cuda.amp.autocast(enabled=False):
+            param0, ftr, cells, features = self._encode(x.float())
+            initial, unused = torch.chunk(param0, 2, dim=1)
+            parameters = tuple(p for p in self.parameters() if p.requires_grad)
+
+            # Initialize data-dependent decoder weights once before recording
+            # the optimization trajectory, never during backward replay.
+            if any(getattr(m, 'data_init', False) and not m.init_done
+                   for m in self.modules()):
+                with torch.no_grad(), temporary_model_state(self):
+                    self._decode(param0, ftr, cells, features, pathwise=True)
+            # Keep the same stats even after the final outer pass updates BN.
+            inner_bn = batchnorm_snapshot(self)
+
+            def objective(local, local_features):
+                # During validation the inner loop still needs the configured
+                # pathwise sampler; final validation samples remain exact.
+                with torch.cuda.amp.autocast(enabled=False), temporary_model_state(self), \
+                        fixed_batchnorm(inner_bn):
+                    output = self._decode(torch.cat((local, torch.zeros_like(local)), 1),
+                                          ftr, cells, local_features, pathwise=True)
+                    logits, _, _, kl_all, _ = output
+                    nll = reconstruction_loss(self.decoder_output(logits), x,
+                                              crop=self.crop_output)
+                    # Each local[i] receives grad f_i, without the 1/B factor
+                    # of a batch mean. Fixed BN removes cross-sample paths.
+                    return (nll + kl_all[0]).sum()
+            refined = refine_momentum(objective, initial, tuple(features), parameters,
+                                      self.group1_svi_steps, self.group1_svi_lr,
+                                      self.group1_svi_momentum, self.group1_svi_eps)
+            self.group1_svi_stats = {
+                'steps': self.group1_svi_steps,
+                'raw_parameter_change': (refined.detach() - initial.detach()).abs().mean(),
+            }
+            # Fresh full hierarchical pass at the FINAL local parameter.
+            return self._decode(torch.cat((refined, unused), 1), ftr, cells, features)
+
+    def _decode(self, param0, ftr, combiner_cells_enc, combiner_cells_s, pathwise=False):
         idx_dec = 0
-        ftr = self.enc0(s)                            # this reduces the channel dimension
-        param0 = self.enc_sampler[idx_dec](ftr)
         dist = self._latent_from_param(idx_dec, param0)   # first approximate posterior
-        z, proposal_log_probs = self._sample_latent(dist, training_sample=self.training)
+        z, proposal_log_probs = self._sample_latent(dist, training_sample=self.training or pathwise)
         log_q_conv = dist.log_p(z)
 
         # apply normalizing flows
@@ -542,7 +600,7 @@ class AutoEncoder(nn.Module):
                     ftr = combiner_cells_enc[idx_dec - 1](combiner_cells_s[idx_dec - 1], s)
                     param = self.enc_sampler[idx_dec](ftr)
                     dist = self._latent_from_param(idx_dec, param, residual_param=prior_param)
-                    z, proposal_log_probs = self._sample_latent(dist, training_sample=self.training)
+                    z, proposal_log_probs = self._sample_latent(dist, training_sample=self.training or pathwise)
                     log_q_conv = dist.log_p(z)
                     # apply NF
                     for n in range(self.num_flows):
@@ -671,8 +729,8 @@ class AutoEncoder(nn.Module):
                 num_iter = self.num_power_iter
                 if i not in self.sr_u:
                     num_w, row, col = weights[i].shape
-                    self.sr_u[i] = F.normalize(torch.ones(num_w, row).normal_(0, 1).cuda(), dim=1, eps=1e-3)
-                    self.sr_v[i] = F.normalize(torch.ones(num_w, col).normal_(0, 1).cuda(), dim=1, eps=1e-3)
+                    self.sr_u[i] = F.normalize(torch.ones(num_w, row).normal_(0, 1).to(weights[i].device), dim=1, eps=1e-3)
+                    self.sr_v[i] = F.normalize(torch.ones(num_w, col).normal_(0, 1).to(weights[i].device), dim=1, eps=1e-3)
                     # increase the number of iterations for the first time
                     num_iter = 10 * self.num_power_iter
 
