@@ -7,6 +7,37 @@ all model gradients. Only the local variational tensor is updated in forward.
 from contextlib import contextmanager
 
 import torch
+from torch.nn.modules.batchnorm import _BatchNorm
+
+
+def batchnorm_snapshot(model):
+    """Freeze inner normalization across samples, steps, and backward replays."""
+    snapshot = []
+    for module in model.modules():
+        if isinstance(module, _BatchNorm):
+            if module.running_mean is None or module.running_var is None:
+                raise ValueError('Per-sample SVI requires BatchNorm running statistics.')
+            snapshot.append((module, module.running_mean.detach().clone(),
+                             module.running_var.detach().clone()))
+    return tuple(snapshot)
+
+
+@contextmanager
+def fixed_batchnorm(snapshot):
+    """Use constant running stats, while retaining affine/input gradients."""
+    previous = [(m, m.training, m.running_mean, m.running_var)
+                for m, _, _ in snapshot]
+    try:
+        for module, mean, var in snapshot:
+            module.training = False
+            module.running_mean = mean
+            module.running_var = var
+        yield
+    finally:
+        for module, training, mean, var in previous:
+            module.training = training
+            module.running_mean = mean
+            module.running_var = var
 
 
 def _rng_state(device):

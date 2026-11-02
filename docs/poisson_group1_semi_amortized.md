@@ -25,15 +25,27 @@ This retains the base branch's positivity, soft clamp, hard rate cap, sampling,
 and analytic Poisson KL. It is momentum descent **in a**, not projected descent
 in lambda. The hard cap's existing zero gradient above the cap is unchanged.
 
-Start from `a_0 = encoder_group1(x)` and `v_0 = 0`. For k = 0,...,n-1:
+For a batch of B images, each image i has its own local tensor `a_{i,0} =
+encoder_group1(x_i)` and momentum `v_{i,0} = 0`. All B images are refined,
+not just one selected image. For k = 0,...,n-1:
 
 1. Construct q1 using a_k; draw z1 with the configured Poisson ST/relaxed sampler.
 2. Recompute every downstream conditional prior/posterior and resample all other
    latent groups. Keep the normal within-scale and cross-scale feature paths.
-3. Decode the full hierarchy and compute the minibatch mean
-   `f_k = NLL(x; z_1,...,z_G) + KL(q1(a_k) || p1)`.
-4. `v_{k+1} = momentum*v_k - grad_a f_k`;
-   `a_{k+1} = a_k + lr*v_{k+1}`.
+3. Decode the full hierarchy and compute each image's own objective
+   `f_{i,k} = NLL(x_i; z_{i,1},...,z_{i,G}) + KL(q1(a_{i,k}) || p1)`.
+4. `v_{i,k+1} = momentum*v_{i,k} - grad_{a_i} f_{i,k}`;
+   `a_{i,k+1} = a_{i,k} + lr*v_{i,k+1}`.
+
+The implementation differentiates `sum_i f_{i,k}` to obtain all independent
+local gradients in parallel. It does **not** divide inner gradients by B.
+Inner decoder BatchNorm (including SyncBatchNormSwish) uses a detached snapshot
+of running mean/variance, captured before refinement and reused for every step
+and backward replay. BN affine parameters remain differentiable. This removes
+cross-image and cross-rank BN paths from the inner objective; independence is
+conditional on the initial parameters and cached encoder features. The ordinary
+encoder still computes its amortized initialization/features in training mode,
+which can use batch statistics. BN without running statistics is rejected.
 
 The local KL coefficient is exactly **1**. No downstream KL, KL balancing,
 annealing, or weight/spectral regularization enters the **inner** objective.
@@ -47,6 +59,15 @@ KL annealing, detached group balancing coefficients, spectral/BN regularization,
 weight decay, and Adamax update. `train/refined_nelbo` separately records the
 unweighted refined NELBO; `train/nelbo_iter` follows the base annealed/balanced
 reporting convention. Only after outer backward does the model optimizer step.
+The outer objective remains a **batch mean**, so all B images contribute to the
+shared encoder/decoder update, including gradients through their local updates.
+Its final decoder pass retains normal training-mode BN and its batch coupling.
+
+Previously the inner objective used a batch mean. At the same local learning
+rate, the new raw local gradient is B times larger when other conditions are
+fixed (the BN change can additionally change the gradient). For a comparable
+initial step scale, start with `old_group1_svi_lr / B` and tune from there.
+Start a new experiment instead of silently resuming an old mean-inner run.
 
 ## Backward
 
@@ -77,7 +98,7 @@ NELBO is guaranteed to decrease on every stochastic step. This implementation
 does not claim numerical identity with a Gaussian SA-VAE run.
 
 Full precision and unscaled outer backward are used when SVI is enabled. Inner
-passes and backward replays do not accumulate BatchNorm running-stat updates;
+passes and backward replays use fixed BatchNorm statistics and do not update them;
 the bottom-up encoder and final decoder pass update their buffers normally.
 Data-dependent decoder initialization runs once before the first trajectory.
 Unconditional prior sampling is unchanged. Validation under `torch.no_grad()`
@@ -103,7 +124,7 @@ mkdir -p logs
 set -o pipefail
 CUDA_VISIBLE_DEVICES=0 MASTER_PORT=6031 bash scripts/train_mnist_poisson_group1_svi.sh \
   --group1_svi_steps 5 \
-  2>&1 | tee logs/mnist_poisson_group1_svi_s2_g2-4_n5.log
+  2>&1 | tee logs/mnist_poisson_group1_svi_s2_g2-4_n5_per_sample.log
 ```
 
 Run inside `screen -S nvae_group1_svi` for a persistent remote terminal. The
@@ -136,7 +157,7 @@ all pre-existing training options above follow the supplied configuration.
 
 NVAE prints encoder-order `groups_per_scale=[4,2]`; this represents decoder-order
 `[2,4]`, not a reversed configuration. The default checkpoint is
-`/root/autodl-tmp/nvae-checkpoints/eval-mnist_poisson_group1_svi_s2_g2-4_n5/checkpoint.pt`.
+`/root/autodl-tmp/nvae-checkpoints/eval-mnist_poisson_group1_svi_s2_g2-4_n5_per_sample/checkpoint.pt`.
 All SVI settings are saved in checkpoint args and restored by `evaluate.py`.
 
 For CPU smoke training use `--device cpu --arch_instance res_elu`. The original
@@ -149,7 +170,9 @@ save normal checkpoints and TensorBoard events. They are not full-data training.
 
 `OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python -m pytest tests -q`
 
-Tests cover smooth stochastic meta-gradients against exact differentiable
+Tests cover independent per-image updates and the full-batch outer gradient
+against separate exact unrolls, fixed BN sample independence and snapshot replay
+after outer running-stat updates, smooth stochastic meta-gradients against exact differentiable
 unrolling (including encoder features and direct/indirect parameter paths), RNG
 preservation, local objective membership, all six groups being recomputed at
 each iteration, finite gradients and actual encoder/decoder parameter updates,

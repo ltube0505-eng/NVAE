@@ -9,7 +9,7 @@ export MASTER_PORT="${MASTER_PORT:-6031}"
 # Extra command-line arguments override defaults below (argparse last value wins).
 python -u train.py \
   --root /root/autodl-tmp/nvae-checkpoints \
-  --save mnist_poisson_group1_svi_s2_g2-4_n5 \
+  --save mnist_poisson_group1_svi_s2_g2-4_n5_per_sample \
   --dataset mnist --data /root/autodl-tmp/datasets/mnist \
   --arch_instance res_mbconv \
   --num_latent_scales 2 --num_groups_per_scale 4 --ada_groups --min_groups_per_scale 1 \

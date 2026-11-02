@@ -1,7 +1,8 @@
 import pytest
 import torch
 
-from group1_svi import refine_momentum, temporary_model_state
+from group1_svi import (refine_momentum, temporary_model_state,
+                        batchnorm_snapshot, fixed_batchnorm)
 from test_mixed_model import _poisson_model
 import utils
 
@@ -14,7 +15,7 @@ def test_momentum_adjoint_matches_exact_unroll_with_feature_and_model_paths():
 
     def objective(local, features):
         noise = torch.randn_like(local)
-        return ((weight * local + features[0] - noise) ** 2).mean()
+        return ((weight * local + features[0] - noise) ** 2).sum()
 
     state = torch.get_rng_state()
     out = refine_momentum(objective, initial, (feature,), (weight,), 3, 0.1, 0.5, 1e-6)
@@ -119,7 +120,7 @@ def test_inner_objective_is_only_reconstruction_plus_first_kl():
     logits, _, _, kl_all, _ = model._decode(torch.cat((initial, unused), 1),
                                           ftr, cells, features)
     local = (utils.reconstruction_loss(model.decoder_output(logits), x, True)
-             + kl_all[0]).mean()
+             + kl_all[0]).sum()
     g, = torch.autograd.grad(local, initial)
     expected = initial.detach() - model.group1_svi_lr * g
     seen = []
@@ -134,6 +135,107 @@ def test_inner_objective_is_only_reconstruction_plus_first_kl():
     model(x)
     assert len(seen) == 2
     assert torch.allclose(seen[-1], expected, atol=1e-6)
+
+
+def test_per_sample_updates_and_full_batch_outer_gradient_match_separate_unrolls():
+    # Independent local trajectories; one shared parameter update from ALL rows.
+    initial = torch.tensor([[0.3, -0.2], [1.1, 0.7]], dtype=torch.double,
+                           requires_grad=True)
+    feature = torch.tensor([[0.2, 0.5], [-0.8, 0.1]], dtype=torch.double,
+                           requires_grad=True)
+    weight = torch.tensor(0.7, dtype=torch.double, requires_grad=True)
+
+    def objective(local, features):
+        return (weight * local + features[0]).square().sum()
+
+    refined = refine_momentum(objective, initial, (feature,), (weight,),
+                              3, 0.1, 0.5, 1e-6)
+    loss = (refined - feature).square().sum(dim=1).mean()
+    actual = torch.autograd.grad(loss, (initial, feature, weight))
+    separate = []
+    for i in range(2):
+        local = initial[i:i+1]
+        velocity = torch.zeros_like(local)
+        for _ in range(3):
+            g, = torch.autograd.grad(objective(local, (feature[i:i+1],)),
+                                    local, create_graph=True)
+            velocity = 0.5 * velocity - g
+            local = local + 0.1 * velocity
+        separate.append(local)
+    expected_out = torch.cat(separate)
+    per_sample = (expected_out - feature).square().sum(dim=1)
+    contributions = [torch.autograd.grad(per_sample[i], weight, retain_graph=True)[0]
+                     for i in range(2)]
+    assert all(g.abs() > 0 for g in contributions)
+    expected = torch.autograd.grad(per_sample.mean(), (initial, feature, weight))
+    assert torch.allclose(refined, expected_out, atol=1e-12)
+    assert torch.allclose(actual[-1], torch.stack(contributions).mean(), atol=2e-6)
+    for a, b in zip(actual, expected):
+        assert torch.allclose(a, b, atol=2e-6, rtol=2e-6)
+
+
+def test_fixed_bn_is_sample_independent_and_replays_snapshot_after_outer_update():
+    model = torch.nn.Sequential(torch.nn.BatchNorm2d(1)).double().train()
+    bn = model[0]
+    snapshot = batchnorm_snapshot(model)
+    original_mean, original_var = bn.running_mean, bn.running_var
+    x = torch.tensor([[[[1., 2.], [3., 4.]]],
+                      [[[9., 7.], [6., 5.]]]], dtype=torch.double,
+                     requires_grad=True)
+    with fixed_batchnorm(snapshot):
+        values = model(x).square().sum(dim=(1, 2, 3))
+    grad, = torch.autograd.grad(values[0], x)
+    assert grad[0].abs().sum() > 0
+    assert torch.equal(grad[1], torch.zeros_like(grad[1]))
+    # An outer training pass updates live stats, but replay must use the old ones.
+    model(x.detach() + 20.)
+    live_mean = bn.running_mean.clone()
+    with fixed_batchnorm(snapshot):
+        replay = model(x).square().sum(dim=(1, 2, 3))
+        single = model(x[:1]).square().sum()
+    assert torch.equal(values, replay)
+    assert torch.allclose(values[0], single)
+    assert bn.training
+    assert bn.running_mean is original_mean and bn.running_var is original_var
+    assert torch.equal(bn.running_mean, live_mean)
+    assert bn.num_batches_tracked == 1
+    replay.mean().backward()
+    assert bn.weight.grad.abs().sum() > 0
+
+
+def test_fixed_bn_restores_state_on_failure_and_rejects_batch_only_stats():
+    model = torch.nn.Sequential(torch.nn.BatchNorm2d(1)).train()
+    mean = model[0].running_mean
+    with pytest.raises(RuntimeError):
+        with fixed_batchnorm(batchnorm_snapshot(model)):
+            raise RuntimeError('test restoration')
+    assert model[0].training and model[0].running_mean is mean
+    with pytest.raises(ValueError, match='running statistics'):
+        batchnorm_snapshot(torch.nn.BatchNorm2d(1, track_running_stats=False))
+
+
+def test_model_inner_bn_snapshot_is_used_in_forward_and_meta_backward():
+    model = _poisson_model('relaxed').train()
+    model.group1_svi_steps = 2
+    model.group1_svi_lr = 0.01
+    bn = torch.nn.BatchNorm2d(1)
+    model.image_conditional = torch.nn.Sequential(model.image_conditional, bn)
+    seen = []
+    bn.register_forward_pre_hook(
+        lambda m, _: seen.append((m.training, m.running_mean.clone())))
+    x = torch.bernoulli(torch.full((2, 1, 32, 32), 0.2))
+    logits, _, _, kls, _ = model(x)
+    assert [mode for mode, _ in seen] == [False, False, True]
+    assert bn.num_batches_tracked == 1
+    live_mean = bn.running_mean.clone()
+    (utils.reconstruction_loss(model.decoder_output(logits), x, True)
+     + sum(kls)).mean().backward()
+    # Two replay passes per momentum step, all with the ORIGINAL fixed stats.
+    assert [mode for mode, _ in seen[3:]] == [False] * 4
+    assert all(torch.equal(mean, seen[0][1]) for _, mean in seen[3:])
+    assert bn.training and bn.num_batches_tracked == 1
+    assert torch.equal(bn.running_mean, live_mean)
+    assert torch.isfinite(bn.weight.grad).all()
 
 
 def test_zero_steps_matches_original_path_and_prior_sampling_ignores_svi():

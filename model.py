@@ -17,7 +17,8 @@ from neural_ar_operations import ELUConv as ARELUConv
 from torch.distributions.bernoulli import Bernoulli
 
 from utils import get_stride_for_cell_type, get_input_size, groups_per_scale, reconstruction_loss
-from group1_svi import refine_momentum, temporary_model_state
+from group1_svi import (refine_momentum, temporary_model_state,
+                        batchnorm_snapshot, fixed_batchnorm)
 from distributions import Normal, Poisson, Gamma, DiscMixLogistic, NormalDecoder
 from thirdparty.inplaced_sync_batchnorm import SyncBatchNormSwish
 
@@ -524,23 +525,28 @@ class AutoEncoder(nn.Module):
             initial, unused = torch.chunk(param0, 2, dim=1)
             parameters = tuple(p for p in self.parameters() if p.requires_grad)
 
-            def objective(local, local_features):
-                # During validation the inner loop still needs the configured
-                # pathwise sampler; final validation samples remain exact.
-                with torch.cuda.amp.autocast(enabled=False), temporary_model_state(self):
-                    output = self._decode(torch.cat((local, torch.zeros_like(local)), 1),
-                                          ftr, cells, local_features, pathwise=True)
-                    logits, _, _, kl_all, _ = output
-                    nll = reconstruction_loss(self.decoder_output(logits), x,
-                                              crop=self.crop_output)
-                    return (nll + kl_all[0]).mean()
-
             # Initialize data-dependent decoder weights once before recording
             # the optimization trajectory, never during backward replay.
             if any(getattr(m, 'data_init', False) and not m.init_done
                    for m in self.modules()):
                 with torch.no_grad(), temporary_model_state(self):
                     self._decode(param0, ftr, cells, features, pathwise=True)
+            # Keep the same stats even after the final outer pass updates BN.
+            inner_bn = batchnorm_snapshot(self)
+
+            def objective(local, local_features):
+                # During validation the inner loop still needs the configured
+                # pathwise sampler; final validation samples remain exact.
+                with torch.cuda.amp.autocast(enabled=False), temporary_model_state(self), \
+                        fixed_batchnorm(inner_bn):
+                    output = self._decode(torch.cat((local, torch.zeros_like(local)), 1),
+                                          ftr, cells, local_features, pathwise=True)
+                    logits, _, _, kl_all, _ = output
+                    nll = reconstruction_loss(self.decoder_output(logits), x,
+                                              crop=self.crop_output)
+                    # Each local[i] receives grad f_i, without the 1/B factor
+                    # of a batch mean. Fixed BN removes cross-sample paths.
+                    return (nll + kl_all[0]).sum()
             refined = refine_momentum(objective, initial, tuple(features), parameters,
                                       self.group1_svi_steps, self.group1_svi_lr,
                                       self.group1_svi_momentum, self.group1_svi_eps)
