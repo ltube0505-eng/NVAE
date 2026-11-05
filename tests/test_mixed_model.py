@@ -91,6 +91,21 @@ def test_all_poisson_maps_every_group_to_poisson():
     assert [model._latent_kind(i) for i in range(6)] == ['poisson'] * 6
 
 
+def test_adaptive_cts_config_reaches_posterior_and_prior_with_legacy_args():
+    # _args mimics old checkpoint arguments, including the old caps and no
+    # new tolerance. Loading must use the new default without a hard rate cap.
+    model = _poisson_model()
+    param = torch.full((1, 4, 2, 2), 8.)
+    q = model._latent_from_param(0, param)
+    p = model._fixed_prior(0, param[:, :2])
+    assert (q.rate > 30.).all()
+    assert q.cts_tail_tolerance == p.cts_tail_tolerance == 1e-4
+    model.poisson_cts_tail_tolerance = 1e-6
+    q = model._latent_from_param(0, param)
+    p = model._fixed_prior(0, param[:, :2])
+    assert q.cts_tail_tolerance == p.cts_tail_tolerance == 1e-6
+
+
 def test_all_poisson_pathwise_estimators_have_finite_gradients():
     for estimator in ('relaxed', 'straight_through'):
         model = _poisson_model(estimator).train()
@@ -130,3 +145,4 @@ def test_obbvi_model_uses_bounded_dmis_weight():
     assert torch.isfinite(objective).all()
     assert torch.isfinite(weight).all()
     assert torch.max(weight) <= len(model.obbvi_taus) + 1e-5
+

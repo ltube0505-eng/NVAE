@@ -5,6 +5,9 @@
 # for NVAE. To view a copy of this license, see the LICENSE file.
 # ---------------------------------------------------------------
 
+import math
+import warnings
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -63,31 +66,72 @@ class Poisson:
     binomial observation model.
     """
 
-    def __init__(self, log_rate, relaxation_temperature=0.1, max_count=64, max_rate=30.):
-        if relaxation_temperature <= 0.:
+    def __init__(self, log_rate, relaxation_temperature=0.1, max_count=None,
+                 max_rate=None, cts_tail_tolerance=1e-4):
+        if not math.isfinite(relaxation_temperature) or relaxation_temperature <= 0.:
             raise ValueError('relaxation_temperature must be positive.')
-        if max_count < 1:
-            raise ValueError('max_count must be at least one.')
-        if max_rate <= 0.:
-            raise ValueError('max_rate must be positive.')
-        max_log_rate = float(np.log(max_rate))
-        clamped_log_rate = torch.clamp(soft_clamp5(log_rate), max=max_log_rate)
-        self.rate = torch.exp(clamped_log_rate)
+        if not 0. < cts_tail_tolerance < 1.:
+            raise ValueError('cts_tail_tolerance must be between zero and one.')
+        if max_count is not None or max_rate is not None:
+            warnings.warn('max_count and max_rate are deprecated and ignored; '
+                          'CTS is adaptive and Poisson rates have no hard cap.',
+                          DeprecationWarning, stacklevel=2)
+        # Preserve the smooth NVAE parameterization, but remove the hard
+        # min(log_rate, log(30)) plateau and its zero gradients.
+        self.rate = torch.exp(soft_clamp5(log_rate))
         # Keep log_p and the analytic KL exactly consistent with ``rate``.
         self.log_rate = torch.log(self.rate)
         self.relaxation_temperature = relaxation_temperature
-        self.max_count = max_count
+        self.cts_tail_tolerance = cts_tail_tolerance
+        self.last_cts_num_terms = None
+        self.last_cts_horizon = None
+
+    def _cts_plan(self):
+        """Choose a horizon and initial term budget from this tensor's rates.
+
+        Beyond H >= 1, the expected omitted sigmoid sum is at most
+        rate * temperature * exp((1-H)/temperature). The term budget is
+        only a vectorization heuristic: sampling continues if it is too small.
+        Planning and stopping decisions are intentionally outside autograd.
+        """
+        max_rate = self.rate.detach().max().item()
+        if not math.isfinite(max_rate) or max_rate <= 0.:
+            raise ValueError('CTS requires finite, positive Poisson rates.')
+        temperature = self.relaxation_temperature
+        log_ratio = (math.log(max_rate) + math.log(temperature)
+                     - math.log(self.cts_tail_tolerance))
+        horizon = 1. + temperature * max(0., log_ratio)
+        mean_count = max_rate * horizon
+        num_terms = int(math.ceil(mean_count + 8. * math.sqrt(mean_count + 1.))) + 1
+        return horizon, num_terms
 
     def _arrival_counts(self):
         """Return hard and relaxed counts built from the same arrivals."""
-        # A homogeneous Poisson count is the number of exponential arrival
-        # times before t=1. Truncation is controlled by max_count/max_rate.
+        # A finite budget alone would still cap the hard count. Continue the
+        # SAME arrival process until every element has crossed H >= 1, so all
+        # arrivals before t=1 are included, including arbitrarily long tails.
+        if self.rate.numel() == 0:
+            self.last_cts_num_terms = 0
+            self.last_cts_horizon = 1.
+            return torch.zeros_like(self.rate), self.rate * 0.
+        horizon, num_terms = self._cts_plan()
         exponential = torch.distributions.Exponential(self.rate)
-        inter_arrivals = exponential.rsample((self.max_count,))
-        arrival_times = torch.cumsum(inter_arrivals, dim=0)
-        hard_count = (arrival_times <= 1.).to(self.rate.dtype).sum(dim=0)
-        soft_count = torch.sigmoid(
-            (1. - arrival_times) / self.relaxation_temperature).sum(dim=0)
+        last_arrival = torch.zeros_like(self.rate)
+        hard_count = torch.zeros_like(self.rate)
+        soft_count = torch.zeros_like(self.rate)
+        total_terms = 0
+        while True:
+            inter_arrivals = exponential.rsample((num_terms,))
+            arrival_times = last_arrival.unsqueeze(0) + torch.cumsum(inter_arrivals, dim=0)
+            hard_count = hard_count + (arrival_times <= 1.).to(self.rate.dtype).sum(dim=0)
+            soft_count = soft_count + torch.sigmoid(
+                (1. - arrival_times) / self.relaxation_temperature).sum(dim=0)
+            last_arrival = arrival_times[-1]
+            total_terms += num_terms
+            if bool((last_arrival.detach() > horizon).all().item()):
+                break
+        self.last_cts_num_terms = total_terms
+        self.last_cts_horizon = horizon
         return hard_count, soft_count
 
     def sample(self, relaxed=False, estimator=None, proposal_tau=None):
@@ -355,3 +399,4 @@ class DiscMixLogistic:
         x = torch.cat([x0, x1, x2], 1)
         x = x / 2. + 0.5
         return x
+

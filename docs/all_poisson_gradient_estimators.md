@@ -35,6 +35,50 @@ T_k=\sum_{j\le k}E_j,
 
 这一区分与 NegBio-VAE 中 Poisson/Gamma-arrival 松弛的语义一致，避免把“连续松弛”和“straight-through”误称为同一种估计器。
 
+### 自适应 CTS 与移除硬截断
+
+Poisson rate 现在为 `exp(5 * tanh(raw_log_rate / 5))`，移除了原来的
+`clamp(max=log(30))`。因此 rate 超过 30 后仍能回传梯度。保留原有平滑
+参数化意味着 rate 仍处于约 `(exp(-5), exp(5))`，并非无界指数参数化。
+这个改变作用于所有 Poisson 后验、条件先验，以及 exact/REINFORCE/O-BBVI 路径。
+
+CTS 不再固定展开 64 项。每次采样取当前 Poisson rate 张量的最大值
+`lambda_max`（同一次 group 调用中的 batch、通道、空间位置共享项数），
+记 sigmoid 温度为 `t`、`--poisson_cts_tail_tolerance` 为 `eps`（默认 `1e-4`）：
+
+```text
+H = 1 + t * max(0, log(lambda_max * t / eps))
+mu = lambda_max * H
+M = ceil(mu + 8 * sqrt(mu + 1)) + 1
+```
+
+先生成 M 个指数间隔，累加成到达时间；如果任何位置的最后到达时间尚未
+超过 H，就从该批最后到达时间继续追加 M 项，直到所有位置均超过 H。
+M 是按当前参数选择的初始预算，不是硬计数上限。`H >= 1` 保证所有
+`T_k <= 1` 的事件都被计入，因此 hard count 没有有限项数造成的封顶。
+追加采样不会重新初始化到达过程；hard/soft count 始终共享同一组样本。
+
+有限 soft sum 仍是无限 CTS 和的数值近似。单坐标在 H 后遗漏的软计数期望满足
+
+\[
+\lambda\int_H^\infty\sigma((1-s)/t)\,ds
+=\lambda t\log(1+e^{(1-H)/t})
+\le\lambda t e^{(1-H)/t}\le\mathrm{eps}.
+\]
+
+实际计算会包含越过 H 的到达项，因此该界是保守的。这是**每个坐标的软计数
+尾项期望界**，不是整批误差界、逐样本绝对误差界或梯度偏差界；ST 仍然有偏。
+规划和停止判断不参与 autograd；已采样到达时间及其软计数保持路径梯度。
+可读取分布对象的 `last_cts_num_terms`、`last_cts_horizon` 检查最近一次采样，
+这两个字段不是自动写入 TensorBoard 的指标。
+
+旧命令行 `--poisson_max_count`、`--poisson_max_rate` 仍可解析，但已弃用且忽略；
+直接调用 `Poisson(..., max_count=..., max_rate=...)` 也只保留兼容入口。
+旧 checkpoint 缺少新字段时默认采用 `1e-4`，权重形状不变，但超过旧 rate 上限的
+分布及采样行为会改变，不能用本分支复现旧版的封顶评估结果。
+较大的 rate、温度或更严格的容差会增加采样项数、显存和计算量；规划和停止检查
+还会触发设备同步。没有另外设置隐藏的最大项数。
+
 ## 2. REINFORCE 目标
 
 对一条精确后验路径 \(z\sim q_\phi(z\mid x)\)，定义带 KL warm-up 的逐样本负目标
@@ -125,7 +169,7 @@ GitHub code search 未找到论文作者公开的独立、可运行 O-BBVI 代�
 # 连续松弛前向
 python train.py ... --latent_distribution poisson --num_nf 0 \
   --poisson_gradient_estimator relaxed \
-  --poisson_relaxation_temperature 0.2 --poisson_max_count 64
+  --poisson_relaxation_temperature 0.2 --poisson_cts_tail_tolerance 1e-4
 
 # REINFORCE
 python train.py ... --latent_distribution poisson --num_nf 0 \
@@ -141,7 +185,7 @@ python train.py ... --latent_distribution poisson --num_nf 0 \
 # 原有 hard-forward / soft-backward 方法
 python train.py ... --latent_distribution poisson --num_nf 0 \
   --poisson_gradient_estimator straight_through \
-  --poisson_relaxation_temperature 0.2 --poisson_max_count 64
+  --poisson_relaxation_temperature 0.2 --poisson_cts_tail_tolerance 1e-4
 ```
 
 验证与生成始终使用目标后验/先验的精确 `torch.poisson` 整数采样，不使用松弛值或 O-BBVI proposal。
@@ -149,7 +193,7 @@ python train.py ... --latent_distribution poisson --num_nf 0 \
 ## 6. 正确性测试
 
 ```bash
-pytest -q
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python -m pytest -q
 ```
 
 新增测试覆盖：
@@ -163,4 +207,10 @@ pytest -q
 6. 全模型 REINFORCE surrogate 可反向传播；
 7. 全模型 O-BBVI 产生有限且有界的 DMIS 权重；
 8. 生成路径仍使用精确 Poisson 先验采样。
+
+自适应 CTS 的回归测试另覆盖：超过 30 的 rate 梯度和密度一致性、超过 64 的
+硬计数及 Poisson 均值/方差、项数对 rate/温度/容差的响应、软计数期望尾界、
+强制追加采样时的到达连续性和梯度、ST/relaxed 共用噪声及相同反向路径、
+旧参数兼容、空张量和非法参数，以及模型后验/先验的新参数传递。
+
 

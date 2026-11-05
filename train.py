@@ -33,6 +33,10 @@ def main(args):
 
     logging = utils.Logger(args.global_rank, args.save)
     writer = utils.Writer(args.global_rank, args.save)
+    if (getattr(args, 'poisson_max_count', None) is not None or
+            getattr(args, 'poisson_max_rate', None) is not None):
+        logging.info('poisson_max_count and poisson_max_rate are deprecated and ignored; '
+                     'CTS uses poisson_cts_tail_tolerance and rates have no hard cap.')
 
     # Get data loaders.
     train_queue, valid_queue, num_classes = datasets.get_loaders(args)
@@ -445,10 +449,13 @@ if __name__ == '__main__':
                         help='gradient estimator used by Poisson latent groups')
     parser.add_argument('--poisson_relaxation_temperature', type=float, default=0.1,
                         help='sigmoid temperature for relaxed/ST Poisson arrival indicators')
-    parser.add_argument('--poisson_max_count', type=int, default=64,
-                        help='number of exponential arrivals used by relaxed Poisson sampling')
-    parser.add_argument('--poisson_max_rate', type=float, default=30.,
-                        help='upper bound on Poisson rates to control count truncation')
+    parser.add_argument('--poisson_cts_tail_tolerance', type=float, default=1e-4,
+                        help='per-coordinate expected omitted CTS soft-count tolerance; '
+                             'term count adapts to current rates and temperature')
+    parser.add_argument('--poisson_max_count', type=int, default=None,
+                        help='deprecated and ignored; CTS term count is adaptive')
+    parser.add_argument('--poisson_max_rate', type=float, default=None,
+                        help='deprecated and ignored; Poisson rates have no hard cap')
     parser.add_argument('--reinforce_num_samples', type=int, default=1,
                         help='exact posterior samples per minibatch for REINFORCE')
     parser.add_argument('--score_baseline_decay', type=float, default=0.9,
@@ -529,3 +536,4 @@ if __name__ == '__main__':
         print('starting in debug mode')
         args.distributed = True
         init_processes(0, size, main, args)
+

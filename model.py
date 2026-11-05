@@ -113,8 +113,9 @@ class AutoEncoder(nn.Module):
         self.num_bits = args.num_x_bits
         self.latent_distribution = getattr(args, 'latent_distribution', 'normal')
         self.poisson_relaxation_temperature = getattr(args, 'poisson_relaxation_temperature', 0.1)
-        self.poisson_max_count = getattr(args, 'poisson_max_count', 64)
-        self.poisson_max_rate = getattr(args, 'poisson_max_rate', 30.)
+        # Legacy checkpoints may still contain max_count/max_rate; neither
+        # should restore a hard cap when loaded with this implementation.
+        self.poisson_cts_tail_tolerance = getattr(args, 'poisson_cts_tail_tolerance', 1e-4)
         self.poisson_gradient_estimator = getattr(
             args, 'poisson_gradient_estimator', 'straight_through')
         valid_estimators = {'relaxed', 'reinforce', 'obbvi', 'straight_through'}
@@ -401,8 +402,7 @@ class AutoEncoder(nn.Module):
         if latent_kind == 'poisson':
             return Poisson(first,
                            relaxation_temperature=self.poisson_relaxation_temperature,
-                           max_count=self.poisson_max_count,
-                           max_rate=self.poisson_max_rate)
+                           cts_tail_tolerance=self.poisson_cts_tail_tolerance)
         return Gamma(first, second, temp=temp)
 
     def _fixed_prior(self, group_index, reference, temp=1.):
@@ -413,8 +413,7 @@ class AutoEncoder(nn.Module):
         if latent_kind == 'poisson':
             return Poisson(zeros,
                            relaxation_temperature=self.poisson_relaxation_temperature,
-                           max_count=self.poisson_max_count,
-                           max_rate=self.poisson_max_rate)
+                           cts_tail_tolerance=self.poisson_cts_tail_tolerance)
         return Gamma(zeros, zeros, temp=temp)
 
     def set_obbvi_component(self, component):
@@ -696,3 +695,4 @@ class AutoEncoder(nn.Module):
                 loss += torch.max(torch.abs(l.weight))
 
         return loss
+
