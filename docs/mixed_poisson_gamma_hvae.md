@@ -73,7 +73,11 @@ $$
 - 生成：所有 Poisson 先验均使用精确 `torch.poisson` 采样。
 - 条件 KL：始终使用解析式。
 
-为控制有限到达序列的截断误差，默认 `max_rate=30`、`max_count=64`。训练前向 count 仍可能在极小概率下被截断；生成没有该截断。
+Poisson rate 保留 `exp(5*tanh(raw_log_rate/5))` 平滑参数化，已移除 rate=30 的硬截断。
+CTS 项数按当前 rate、温度及 `poisson_cts_tail_tolerance`（默认 `1e-4`）自动决定，
+并持续追加到达事件直至越过尾项控制时间。训练 hard count 不再被有限项数封顶；
+soft count 的遗漏尾项期望按每坐标控制。完整公式与兼容说明见
+[全 Poisson 文档](all_poisson_gradient_estimators.md#自适应-cts-与移除硬截断)。
 
 ### Gamma groups
 
@@ -84,7 +88,7 @@ Gamma 使用 shape/rate 参数化，采样调用 PyTorch `Gamma.rsample()` 的�
 1. **Poisson 梯度有偏。** Straight-through 松弛可降低方差，但不是离散 ELBO 重建项的无偏梯度估计。应与 REINFORCE/VIMCO/RELAX 或 generalized Gumbel-Softmax 基线对照。
 2. **误差会沿层级传播。** 第二个 Poisson group 及其后的 Gamma groups 都依赖前序随机样本；一次 Monte Carlo 路径的噪声会影响所有后续条件分布。可增加每个样本的路径数，但显存与计算量近似线性增长。
 3. **Poisson 的均值等于方差。** 数据若明显过度离散，Negative Binomial（Gamma–Poisson compound）通常比纯 Poisson 更合适。
-4. **计数可能爆炸或塌缩为零。** 本实现限制 rate，并应持续监控每组 rate、零比例、最大 count 与 KL；rate clipping 本身也会造成边界梯度饱和。
+4. **计数可能变大或塌缩为零。** 本实现保留平滑 rate 参数化，但不再硬截断到 30；应持续监控每组 rate、零比例、最大 count 与 KL。自适应 CTS 在 rate 或温度增大时会消耗更多计算和显存。
 5. **非负 latent 改变 decoder 输入统计。** 原 NVAE 针对近似零均值 Gaussian latent 调优。网络结构虽然未变，学习率、KL warm-up、batch norm 统计和初始化可能需要重新搜索。
 6. **Normalizing flow 不兼容。** 原代码的 flow 是为 Normal base distribution 编写的；混合模式会拒绝 `num_nf > 0`，否则先验/后验将不再是用户指定的 Poisson/Gamma。
 7. **跨数据集的似然仍不可混比。** 本实现恢复了原版 NVAE 的 dataset-default reconstruction，因此同一数据集、同一 `num_mixture_dec` 配置下的 bpd/NLL 口径与原版一致；但 Bernoulli、NormalDecoder 与 discretized mixture of logistics 之间仍是不同的观测模型。
@@ -102,8 +106,7 @@ python train.py \
   --num_nf 0 \
   --res_dist \
   --poisson_relaxation_temperature 0.1 \
-  --poisson_max_rate 30 \
-  --poisson_max_count 64
+  --poisson_cts_tail_tolerance 1e-4
 ```
 
 混合模式只校验 group 配置以及 `num_nf=0`，不会覆盖 reconstruction。原版 NVAE 与混合 latent 模式都通过相同的 dataset-default 分支选择 Bernoulli、NormalDecoder 或 discretized mixture of logistics，因此可以在保持观测模型一致的前提下比较 latent family。
@@ -111,7 +114,8 @@ python train.py \
 ## 建议实验
 
 - 先在 MNIST/CIFAR-10 上做小规模 smoke run，检查六个 group 的 KL 是否均为有限值。
-- 记录两个 Poisson group 的 mean rate、零比例、达到 `max_count` 的比例，以及四个 Gamma group 的 shape/rate 分位数。
+- 记录两个 Poisson group 的 mean rate、零比例、最大 count、实际 CTS 项数，以及四个 Gamma group 的 shape/rate 分位数。
 - 对比至少三个估计器：当前 straight-through、score-function + control variate、连续松弛。
 - 做消融：全 Gamma、低分辨率 Negative Binomial、高分辨率 Normal，以及每个输入 1/4/8 条随机路径。
-- 只有在截断比例接近零、梯度无 NaN、各 group 非塌缩后，再进行完整 NVAE 规模训练。
+- 只有在 CTS 项数和显存可接受、梯度无 NaN、各 group 非塌缩后，再进行完整 NVAE 规模训练。
+
