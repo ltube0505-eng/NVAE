@@ -484,6 +484,12 @@ if __name__ == '__main__':
                         help='gradient estimator used by Poisson latent groups')
     parser.add_argument('--poisson_relaxation_temperature', type=float, default=0.1,
                         help='sigmoid temperature for relaxed/ST Poisson arrival indicators')
+    parser.add_argument('--poisson_smooth_ste', action='store_true', default=False,
+                        help='smoothly blend the ST/relaxed rate derivative with 1 at small rates')
+    parser.add_argument('--poisson_ste_rate_scale', type=float, default=0.35,
+                        help='positive rate where STE and pathwise gradient weights are equal')
+    parser.add_argument('--poisson_ste_power', type=float, default=4.,
+                        help='positive power controlling the smooth STE transition steepness')
     parser.add_argument('--poisson_cts_tail_tolerance', type=float, default=1e-4,
                         help='per-coordinate expected omitted CTS soft-count tolerance; '
                              'term count adapts to current rates and temperature')

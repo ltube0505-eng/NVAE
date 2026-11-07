@@ -33,6 +33,10 @@ latents. Their ST/relaxed derivatives remain in J. Consequently this is a
 pathwise surrogate metric, not the exact Fisher of the joint hierarchical q or
 p, nor the Fisher of p(x). Batch-normalized examples are also coupled.
 
+The optional [smooth low-rate STE](poisson_smooth_ste.md) changes ancestor-sample
+derivatives in J as well as objective gradients. The Poisson rate weights and
+optimizer update rule stay the same; the metric still uses a surrogate Jacobian.
+
 For independent Rademacher signs epsilon, compute
 
     v = J^T [sqrt(lambda) * epsilon] / sqrt(B)
