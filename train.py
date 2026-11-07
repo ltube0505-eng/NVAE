@@ -17,6 +17,7 @@ from torch.cuda.amp import autocast, GradScaler
 
 from model import AutoEncoder
 from thirdparty.adamax import Adamax
+from poisson_fisher import PoissonDiagonalFisher
 import utils
 import datasets
 
@@ -38,6 +39,11 @@ def main(args):
         logging.info('poisson_max_count and poisson_max_rate are deprecated and ignored; '
                      'CTS uses poisson_cts_tail_tolerance and rates have no hard cap.')
 
+    use_fisher = args.optimizer == 'poisson_fisher'
+    if use_fisher and (args.latent_distribution != 'poisson' or
+                       args.poisson_gradient_estimator not in {'straight_through', 'relaxed'}):
+        raise ValueError('poisson_fisher requires all-Poisson latents and ST or relaxed sampling')
+
     # Get data loaders.
     train_queue, valid_queue, num_classes = datasets.get_loaders(args)
     args.num_total_iter = len(train_queue) * args.epochs
@@ -53,7 +59,13 @@ def main(args):
     logging.info('param size = %fM ', utils.count_parameters_in_M(model))
     logging.info('groups per scale: %s, total_groups: %d', model.groups_per_scale, sum(model.groups_per_scale))
 
-    if args.fast_adamax:
+    model.collect_poisson_fisher = use_fisher
+    if use_fisher:
+        cnn_optimizer = PoissonDiagonalFisher(
+            model.parameters(), lr=args.learning_rate, damping=args.fisher_damping,
+            decay=args.fisher_decay, probes=args.fisher_probes,
+            step_budget=args.fisher_step_budget, weight_decay=args.weight_decay)
+    elif args.fast_adamax:
         # Fast adamax has the same functionality as torch.optim.Adamax, except it is faster.
         cnn_optimizer = Adamax(model.parameters(), args.learning_rate,
                                weight_decay=args.weight_decay, eps=1e-3)
@@ -63,7 +75,7 @@ def main(args):
 
     cnn_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         cnn_optimizer, float(args.epochs - args.warmup_epochs - 1), eta_min=args.learning_rate_min)
-    grad_scalar = GradScaler(2**10)
+    grad_scalar = GradScaler(2**10, enabled=not use_fisher)
 
     num_output = utils.num_output(args.dataset)
     bpd_coeff = 1. / np.log(2.) / num_output
@@ -76,8 +88,16 @@ def main(args):
         init_epoch = checkpoint['epoch']
         model.load_state_dict(checkpoint['state_dict'])
         model = model.cuda()
-        cnn_optimizer.load_state_dict(checkpoint['optimizer'])
-        grad_scalar.load_state_dict(checkpoint['grad_scalar'])
+        previous_optimizer = getattr(checkpoint['args'], 'optimizer', 'adamax')
+        if not args.reset_optimizer:
+            if previous_optimizer != args.optimizer:
+                raise ValueError('Changing optimizer on resume requires --reset_optimizer')
+            cnn_optimizer.load_state_dict(checkpoint['optimizer'])
+            grad_scalar.load_state_dict(checkpoint['grad_scalar'])
+        else:
+            for group, saved in zip(cnn_optimizer.param_groups, checkpoint['optimizer']['param_groups']):
+                group['lr'] = saved['lr']
+            logging.info('Reset optimizer/scaler state; preserving model, epoch, step, and scheduler.')
         cnn_scheduler.load_state_dict(checkpoint['scheduler'])
         global_step = checkpoint['global_step']
     else:
@@ -167,7 +187,7 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
             utils.average_params(model.parameters(), args.distributed)
 
         cnn_optimizer.zero_grad()
-        with autocast():
+        with autocast(enabled=not isinstance(cnn_optimizer, PoissonDiagonalFisher)):
             kl_coeff = utils.kl_coeff(global_step, args.kl_anneal_portion * args.num_total_iter,
                                       args.kl_const_portion * args.num_total_iter, args.kl_const_coeff)
             score_estimator = model.poisson_gradient_estimator in {'reinforce', 'obbvi'}
@@ -239,6 +259,9 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
 
             loss += norm_loss * wdn_coeff + bn_loss * wdn_coeff
 
+        if isinstance(cnn_optimizer, PoissonDiagonalFisher):
+            cnn_optimizer.estimate_curvature(model.poisson_fisher_log_rates, args.distributed)
+            model.poisson_fisher_log_rates = []
         grad_scalar.scale(loss).backward()
         utils.average_gradients(model.parameters(), args.distributed)
         grad_scalar.step(cnn_optimizer)
@@ -257,6 +280,9 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
                 writer.add_image('reconstruction', in_out_tiled, global_step)
 
             # norm
+            if isinstance(cnn_optimizer, PoissonDiagonalFisher):
+                for name, value in cnn_optimizer.last_stats.items():
+                    writer.add_scalar('fisher/' + name, value, global_step)
             writer.add_scalar('train/norm_loss', norm_loss, global_step)
             writer.add_scalar('train/bn_loss', bn_loss, global_step)
             writer.add_scalar('train/norm_coeff', wdn_coeff, global_step)
@@ -434,6 +460,15 @@ if __name__ == '__main__':
                         help='The number of normalizing flow cells per groups. Set this to zero to disable flows.')
     parser.add_argument('--num_x_bits', type=int, default=8,
                         help='The number of bits used for representing data for colored images.')
+    parser.add_argument('--optimizer', choices=['adamax', 'poisson_fisher'], default='adamax',
+                        help='Poisson Fisher uses FP32 damped diagonal updates instead of Adamax')
+    parser.add_argument('--fisher_damping', type=float, default=1e-2)
+    parser.add_argument('--fisher_decay', type=float, default=0.95)
+    parser.add_argument('--fisher_probes', type=int, default=1)
+    parser.add_argument('--fisher_step_budget', type=float, default=1e-2,
+                        help='budget for the damped diagonal quadratic parameter step')
+    parser.add_argument('--reset_optimizer', action='store_true',
+                        help='resume model/epoch/scheduler with fresh optimizer and scaler state')
     # latent variables
     parser.add_argument('--num_latent_scales', type=int, default=1,
                         help='the number of latent scales')
