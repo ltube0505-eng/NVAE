@@ -110,6 +110,8 @@ class AutoEncoder(nn.Module):
         self.crop_output = self.dataset in {'mnist', 'omniglot', 'stacked_mnist'}
         self.use_se = args.use_se
         self.res_dist = args.res_dist
+        self.collect_poisson_fisher = False
+        self.poisson_fisher_log_rates = []
         self.num_bits = args.num_x_bits
         self.latent_distribution = getattr(args, 'latent_distribution', 'normal')
         self.poisson_relaxation_temperature = getattr(args, 'poisson_relaxation_temperature', 0.1)
@@ -400,9 +402,12 @@ class AutoEncoder(nn.Module):
         if latent_kind == 'normal':
             return Normal(first, second, temp=temp)
         if latent_kind == 'poisson':
-            return Poisson(first,
-                           relaxation_temperature=self.poisson_relaxation_temperature,
-                           cts_tail_tolerance=self.poisson_cts_tail_tolerance)
+            distribution = Poisson(first,
+                                   relaxation_temperature=self.poisson_relaxation_temperature,
+                                   cts_tail_tolerance=self.poisson_cts_tail_tolerance)
+            if self.collect_poisson_fisher and self.training and torch.is_grad_enabled():
+                self.poisson_fisher_log_rates.append(distribution.log_rate)
+            return distribution
         return Gamma(first, second, temp=temp)
 
     def _fixed_prior(self, group_index, reference, temp=1.):
@@ -477,6 +482,7 @@ class AutoEncoder(nn.Module):
         return generative + inference, sampled_nelbo.detach(), importance_weight
 
     def forward(self, x):
+        self.poisson_fisher_log_rates = []
         s = self.stem(2 * x - 1.0)
 
         # perform pre-processing
