@@ -143,7 +143,7 @@ class Poisson:
         self.last_cts_horizon = horizon
         return hard_count, soft_count
 
-    def _smooth_ste_surrogate(self, soft_count):
+    def _smooth_ste_weight(self):
         # sigmoid(p * log(rate / scale)) = rate**p / (rate**p + scale**p).
         # Work in log space to avoid power overflow, including under AMP.
         log_rate = self.log_rate.detach()
@@ -151,7 +151,10 @@ class Poisson:
             log_rate = log_rate.float()
         weight = torch.sigmoid(self.ste_power *
                                (log_rate - math.log(self.ste_rate_scale)))
-        weight = weight.to(dtype=self.rate.dtype)
+        return weight.to(dtype=self.rate.dtype)
+
+    def _smooth_ste_surrogate(self, soft_count):
+        weight = self._smooth_ste_weight()
         # Detached weights give exactly (1-w) + w * d soft_count / d rate,
         # without the unwanted w' * (soft_count-rate) term.
         return (1. - weight) * self.rate + weight * soft_count
