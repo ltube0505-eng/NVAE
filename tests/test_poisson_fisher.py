@@ -89,9 +89,11 @@ def test_nonfinite_gradient_does_not_change_parameters_or_fisher():
     assert not opt.state
 
 
-def test_poisson_model_forward_backward_and_eval_collection():
+@pytest.mark.parametrize('smooth_ste', [False, True])
+def test_poisson_model_forward_backward_and_eval_collection(smooth_ste):
     from test_mixed_model import _poisson_model
     model = _poisson_model()
+    model.poisson_smooth_ste = smooth_ste
     model.collect_poisson_fisher = True
     model.train()
     opt = PoissonDiagonalFisher(model.parameters(), lr=1e-4)
@@ -107,7 +109,8 @@ def test_poisson_model_forward_backward_and_eval_collection():
     assert model.poisson_fisher_log_rates == []
 
 
-def test_training_entry_uses_fisher_before_backward(monkeypatch):
+@pytest.mark.parametrize('smooth_ste', [False, True])
+def test_training_entry_uses_fisher_before_backward(monkeypatch, smooth_ste):
     # Execute the real train() body without importing GPU/FID/dataset startup.
     import ast
     from pathlib import Path
@@ -130,6 +133,7 @@ def test_training_entry_uses_fisher_before_backward(monkeypatch):
     exec(compile(module, 'train.py', 'exec'), namespace)
     monkeypatch.setattr(torch.Tensor, 'cuda', lambda tensor, *args, **kwargs: tensor)
     model = _poisson_model()
+    model.poisson_smooth_ste = smooth_ste
     model.collect_poisson_fisher = True
     monkeypatch.setattr(model, 'spectral_norm_parallel', lambda: torch.tensor(0.))
     monkeypatch.setattr(model, 'batchnorm_loss', lambda: torch.tensor(0.))

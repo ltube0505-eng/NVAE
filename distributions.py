@@ -58,7 +58,9 @@ class Poisson:
 
     ``relaxed`` uses the exponential-arrival construction used by PoissonVAE
     and NegBio-VAE.  ``straight_through`` has an integer forward value and the
-    same relaxed backward path.  Score-function estimators use ``exact``.
+    same relaxed backward path. Optional ``smooth_ste`` blends this rate
+    derivative with 1 at small rates without changing either forward value.
+    Score-function estimators use ``exact``.
 
     For O-BBVI, a dispersion coefficient ``tau`` defines the proposal
     ``Poisson(rate ** (1 / tau))``.  This is the overdispersed exponential-
@@ -67,11 +69,15 @@ class Poisson:
     """
 
     def __init__(self, log_rate, relaxation_temperature=0.1, max_count=None,
-                 max_rate=None, cts_tail_tolerance=1e-4):
+                 max_rate=None, cts_tail_tolerance=1e-4, smooth_ste=False,
+                 ste_rate_scale=0.35, ste_power=4.):
         if not math.isfinite(relaxation_temperature) or relaxation_temperature <= 0.:
             raise ValueError('relaxation_temperature must be positive.')
         if not 0. < cts_tail_tolerance < 1.:
             raise ValueError('cts_tail_tolerance must be between zero and one.')
+        for name, value in [('ste_rate_scale', ste_rate_scale), ('ste_power', ste_power)]:
+            if not math.isfinite(value) or value <= 0.:
+                raise ValueError('%s must be finite and positive.' % name)
         if max_count is not None or max_rate is not None:
             warnings.warn('max_count and max_rate are deprecated and ignored; '
                           'CTS is adaptive and Poisson rates have no hard cap.',
@@ -83,6 +89,9 @@ class Poisson:
         self.log_rate = torch.log(self.rate)
         self.relaxation_temperature = relaxation_temperature
         self.cts_tail_tolerance = cts_tail_tolerance
+        self.smooth_ste = smooth_ste
+        self.ste_rate_scale = ste_rate_scale
+        self.ste_power = ste_power
         self.last_cts_num_terms = None
         self.last_cts_horizon = None
 
@@ -134,6 +143,22 @@ class Poisson:
         self.last_cts_horizon = horizon
         return hard_count, soft_count
 
+    def _smooth_ste_weight(self):
+        # sigmoid(p * log(rate / scale)) = rate**p / (rate**p + scale**p).
+        # Work in log space to avoid power overflow, including under AMP.
+        log_rate = self.log_rate.detach()
+        if log_rate.dtype in (torch.float16, torch.bfloat16):
+            log_rate = log_rate.float()
+        weight = torch.sigmoid(self.ste_power *
+                               (log_rate - math.log(self.ste_rate_scale)))
+        return weight.to(dtype=self.rate.dtype)
+
+    def _smooth_ste_surrogate(self, soft_count):
+        weight = self._smooth_ste_weight()
+        # Detached weights give exactly (1-w) + w * d soft_count / d rate,
+        # without the unwanted w' * (soft_count-rate) term.
+        return (1. - weight) * self.rate + weight * soft_count
+
     def sample(self, relaxed=False, estimator=None, proposal_tau=None):
         """Sample with a named gradient estimator.
 
@@ -154,6 +179,10 @@ class Poisson:
             return torch.poisson(self.proposal_rate(proposal_tau)), None
 
         hard_count, soft_count = self._arrival_counts()
+        if self.smooth_ste and estimator in {'relaxed', 'straight_through'}:
+            surrogate = self._smooth_ste_surrogate(soft_count)
+            forward_count = soft_count if estimator == 'relaxed' else hard_count
+            return forward_count.detach() + (surrogate - surrogate.detach()), None
         if estimator == 'relaxed':
             return soft_count, None
         if estimator == 'straight_through':

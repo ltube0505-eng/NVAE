@@ -118,12 +118,19 @@ class AutoEncoder(nn.Module):
         # Legacy checkpoints may still contain max_count/max_rate; neither
         # should restore a hard cap when loaded with this implementation.
         self.poisson_cts_tail_tolerance = getattr(args, 'poisson_cts_tail_tolerance', 1e-4)
+        self.poisson_smooth_ste = getattr(args, 'poisson_smooth_ste', False)
+        self.poisson_ste_rate_scale = getattr(args, 'poisson_ste_rate_scale', 0.35)
+        self.poisson_ste_power = getattr(args, 'poisson_ste_power', 4.)
         self.poisson_gradient_estimator = getattr(
             args, 'poisson_gradient_estimator', 'straight_through')
         valid_estimators = {'relaxed', 'reinforce', 'obbvi', 'straight_through'}
         if self.poisson_gradient_estimator not in valid_estimators:
             raise ValueError('Unknown Poisson gradient estimator: %s' %
                              self.poisson_gradient_estimator)
+        if self.poisson_smooth_ste and (
+                self.latent_distribution not in {'poisson', 'mixed_poisson_gamma'} or
+                self.poisson_gradient_estimator not in {'straight_through', 'relaxed'}):
+            raise ValueError('poisson_smooth_ste requires Poisson latents and ST or relaxed sampling.')
         obbvi_taus = getattr(args, 'obbvi_taus', '1.0,3.0')
         if isinstance(obbvi_taus, str):
             obbvi_taus = [float(tau.strip()) for tau in obbvi_taus.split(',') if tau.strip()]
@@ -404,7 +411,10 @@ class AutoEncoder(nn.Module):
         if latent_kind == 'poisson':
             distribution = Poisson(first,
                                    relaxation_temperature=self.poisson_relaxation_temperature,
-                                   cts_tail_tolerance=self.poisson_cts_tail_tolerance)
+                                   cts_tail_tolerance=self.poisson_cts_tail_tolerance,
+                                   smooth_ste=self.poisson_smooth_ste,
+                                   ste_rate_scale=self.poisson_ste_rate_scale,
+                                   ste_power=self.poisson_ste_power)
             if self.collect_poisson_fisher and self.training and torch.is_grad_enabled():
                 self.poisson_fisher_log_rates.append(distribution.log_rate)
             return distribution
@@ -418,7 +428,10 @@ class AutoEncoder(nn.Module):
         if latent_kind == 'poisson':
             return Poisson(zeros,
                            relaxation_temperature=self.poisson_relaxation_temperature,
-                           cts_tail_tolerance=self.poisson_cts_tail_tolerance)
+                           cts_tail_tolerance=self.poisson_cts_tail_tolerance,
+                           smooth_ste=self.poisson_smooth_ste,
+                           ste_rate_scale=self.poisson_ste_rate_scale,
+                           ste_power=self.poisson_ste_power)
         return Gamma(zeros, zeros, temp=temp)
 
     def set_obbvi_component(self, component):

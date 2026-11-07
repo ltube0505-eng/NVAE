@@ -399,6 +399,11 @@ interface selects continuous relaxation, REINFORCE, O-BBVI/DMIS, or the
 existing straight-through estimator. See the [mathematical definition,
 commands, implementation notes, and tests](docs/all_poisson_gradient_estimators.md).
 
+For adaptive CTS with diagonal Fisher updates, an optional
+`--poisson_smooth_ste` smoothly blends the low-rate derivative toward 1.
+See [the algorithm, training flags, and bias/variance limits](docs/poisson_smooth_ste.md)
+and [the Fisher optimizer notes](docs/poisson_diagonal_fisher.md).
+
 
 ## Traversing the latent space
 We can generate images by traversing in the latent space of NVAE. This sequence is generated using our model

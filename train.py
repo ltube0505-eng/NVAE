@@ -6,6 +6,7 @@
 # ---------------------------------------------------------------
 
 import argparse
+from functools import partial
 import torch
 import torch.nn as nn
 import numpy as np
@@ -25,7 +26,7 @@ from fid.fid_score import compute_statistics_of_generator, load_statistics, calc
 from fid.inception import InceptionV3
 
 
-def main(args):
+def main(args, grad_monitor=None):
     # ensures that weight initializations are all the same
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -33,7 +34,8 @@ def main(args):
     torch.cuda.manual_seed_all(args.seed)
 
     logging = utils.Logger(args.global_rank, args.save)
-    writer = utils.Writer(args.global_rank, args.save)
+    writer = (utils.Writer(args.global_rank, args.save) if grad_monitor is None else
+              grad_monitor.make_writer(utils.Writer, args))
     if (getattr(args, 'poisson_max_count', None) is not None or
             getattr(args, 'poisson_max_rate', None) is not None):
         logging.info('poisson_max_count and poisson_max_rate are deprecated and ignored; '
@@ -84,7 +86,8 @@ def main(args):
     checkpoint_file = os.path.join(args.save, 'checkpoint.pt')
     if args.cont_training:
         logging.info('loading the model.')
-        checkpoint = torch.load(checkpoint_file, map_location='cpu')
+        checkpoint = (torch.load(checkpoint_file, map_location='cpu') if grad_monitor is None else
+                      grad_monitor.load_checkpoint(checkpoint_file))
         init_epoch = checkpoint['epoch']
         model.load_state_dict(checkpoint['state_dict'])
         model = model.cuda()
@@ -116,7 +119,9 @@ def main(args):
         logging.info('epoch %d', epoch)
 
         # Training.
-        train_nelbo, global_step = train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_iters, writer, logging)
+        train_nelbo, global_step = train(
+            train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_iters,
+            writer, logging, grad_monitor=grad_monitor)
         logging.info('train_nelbo %f', train_nelbo)
         writer.add_scalar('train/nelbo', train_nelbo, global_step)
 
@@ -164,7 +169,8 @@ def main(args):
     writer.close()
 
 
-def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_iters, writer, logging):
+def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_iters,
+          writer, logging, grad_monitor=None):
     alpha_i = utils.kl_balancer_coeff(num_scales=model.num_latent_scales,
                                       groups_per_scale=model.groups_per_scale, fun='square')
     nelbo = utils.AvgrageMeter()
@@ -187,6 +193,8 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
             utils.average_params(model.parameters(), args.distributed)
 
         cnn_optimizer.zero_grad()
+        if grad_monitor is not None:
+            grad_monitor.begin(model, writer, global_step, grad_scalar, x)
         with autocast(enabled=not isinstance(cnn_optimizer, PoissonDiagonalFisher)):
             kl_coeff = utils.kl_coeff(global_step, args.kl_anneal_portion * args.num_total_iter,
                                       args.kl_const_portion * args.num_total_iter, args.kl_const_coeff)
@@ -259,12 +267,19 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
 
             loss += norm_loss * wdn_coeff + bn_loss * wdn_coeff
 
+        if grad_monitor is not None and grad_monitor.active:
+            grad_monitor.report(recon_loss, balanced_kl, kl_all, loss)
+
         if isinstance(cnn_optimizer, PoissonDiagonalFisher):
             cnn_optimizer.estimate_curvature(model.poisson_fisher_log_rates, args.distributed)
             model.poisson_fisher_log_rates = []
         grad_scalar.scale(loss).backward()
         utils.average_gradients(model.parameters(), args.distributed)
+        if grad_monitor is not None:
+            grad_monitor.after_backward(model, grad_scalar)
         grad_scalar.step(cnn_optimizer)
+        if grad_monitor is not None:
+            grad_monitor.after_step(cnn_optimizer)
         grad_scalar.update()
         nelbo.update(reported_nelbo.data, 1)
 
@@ -409,7 +424,8 @@ def cleanup():
     dist.destroy_process_group()
 
 
-if __name__ == '__main__':
+def run_cli(argv=None, grad_monitor=None):
+    global args
     parser = argparse.ArgumentParser('encoder decoder examiner')
     # experimental results
     parser.add_argument('--root', type=str, default='/tmp/nasvae/expr',
@@ -484,6 +500,12 @@ if __name__ == '__main__':
                         help='gradient estimator used by Poisson latent groups')
     parser.add_argument('--poisson_relaxation_temperature', type=float, default=0.1,
                         help='sigmoid temperature for relaxed/ST Poisson arrival indicators')
+    parser.add_argument('--poisson_smooth_ste', action='store_true', default=False,
+                        help='smoothly blend the ST/relaxed rate derivative with 1 at small rates')
+    parser.add_argument('--poisson_ste_rate_scale', type=float, default=0.35,
+                        help='positive rate where STE and pathwise gradient weights are equal')
+    parser.add_argument('--poisson_ste_power', type=float, default=4.,
+                        help='positive power controlling the smooth STE transition steepness')
     parser.add_argument('--poisson_cts_tail_tolerance', type=float, default=1e-4,
                         help='per-coordinate expected omitted CTS soft-count tolerance; '
                              'term count adapts to current rates and temperature')
@@ -545,7 +567,11 @@ if __name__ == '__main__':
                         help='address for master')
     parser.add_argument('--seed', type=int, default=1,
                         help='seed used for initialization')
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if grad_monitor is not None:
+        args = grad_monitor.resume_args(args)
+        if args.num_process_per_node != 1 or args.num_proc_node != 1:
+            parser.error('The gradient monitor requires one GPU and one node.')
     args.save = args.root + '/eval-' + args.save
     utils.create_exp_dir(args.save)
 
@@ -570,5 +596,9 @@ if __name__ == '__main__':
         # for debugging
         print('starting in debug mode')
         args.distributed = True
-        init_processes(0, size, main, args)
+        train_main = main if grad_monitor is None else partial(main, grad_monitor=grad_monitor)
+        init_processes(0, size, train_main, args)
 
+
+if __name__ == '__main__':
+    run_cli()
