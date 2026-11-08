@@ -231,11 +231,8 @@ class GradientMonitor:
             self.stats('state/p1/' + key, priors[0][key])
             self.positions('prior/p1/' + key, priors[0][key])
         for name, record in zip(('q0', 'q1', 'p1'), self.sampled + priors):
-            raw = record['raw'].detach().float()
-            slope = 1. - torch.tanh(raw / 5.).pow(2)
-            self.stats('state/' + name + '/soft_clamp_slope', slope)
-            self.scalar('state/' + name + '/soft_clamp_near_zero_fraction',
-                        (slope.abs() < 1e-3).float().mean().item())
+            # lambda = exp(raw): the local rate Jacobian is lambda itself.
+            self.stats('state/' + name + '/drate_draw', record['rate'].detach())
         for name, (kind, tensor) in self.activations.items():
             value = tensor.detach().float()
             if kind == 'elu':
@@ -384,7 +381,7 @@ def self_test():
     class Model(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.raw0 = torch.nn.Parameter(torch.full((2, 1, 4, 4), 5. * math.atanh(math.log(0.1) / 5.)))
+            self.raw0 = torch.nn.Parameter(torch.full((2, 1, 4, 4), math.log(0.1)))
             self.raw1 = torch.nn.Parameter(torch.full((2, 1, 4, 4), 0.1))
             self.prior_bias = torch.nn.Parameter(torch.zeros(2, 1, 4, 4))
             self.latent_distribution = 'poisson'
@@ -442,14 +439,17 @@ def self_test():
         prefix = 'grad_positions/current_batch/sample_0/'
         suffix = '/c00/h0_w0'
         values = writer.values
+        for name in ('q0', 'q1', 'p1'):
+            base = 'grad_monitor/state/' + name + '/'
+            assert values[base + 'drate_draw/mean'] == values[base + 'rate/mean']
+        assert not any('soft_clamp' in tag for tag in values)
         rate = values[prefix + 'posterior/q0/rate' + suffix]
         w = values[prefix + 'sampling/q0/cts_weight' + suffix]
         g = values[prefix + 'sampling/q0/cts_dz_drate' + suffix]
         blended = values[prefix + 'sampling/q0/dz_drate' + suffix]
         assert math.isclose(w, rate ** 4 / (rate ** 4 + 0.35 ** 4), rel_tol=1e-5)
         assert math.isclose(blended, (1. - w) + w * g, rel_tol=1e-5)
-        raw = values[prefix + 'posterior/q0/raw' + suffix]
-        chain = rate * (1. - math.tanh(raw / 5.) ** 2)
+        chain = rate
         assert math.isclose(values[prefix + 'sampling/q0/dz_draw' + suffix],
                             blended * chain, rel_tol=1e-5)
         assert values['grad_monitor/sampling/q0/cts_num_terms'] > 0.
@@ -465,7 +465,7 @@ def self_test():
         monitor.begin(model, writer, 2, scaler)
         model()
         assert not monitor.records and not monitor.nodes
-        print('PASS: adaptive CTS, smooth STE and tanh derivatives, AMP unscaling, '
+        print('PASS: adaptive CTS, smooth STE and exponential derivatives, AMP unscaling, '
               'unchanged gradients/RNG, per-position logging, and nonfinite filtering.')
     finally:
         monitor.close()

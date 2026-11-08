@@ -37,9 +37,9 @@ T_k=\sum_{j\le k}E_j,
 
 ### 自适应 CTS 与移除硬截断
 
-Poisson rate 现在为 `exp(5 * tanh(raw_log_rate / 5))`，移除了原来的
-`clamp(max=log(30))`。因此 rate 超过 30 后仍能回传梯度。保留原有平滑
-参数化意味着 rate 仍处于约 `(exp(-5), exp(5))`，并非无界指数参数化。
+Poisson rate 现在为 `exp(raw_log_rate)`，已去除 `5*tanh(a/5)` 变换，
+也没有 `clamp(max=log(30))` 硬截断。其导数为 `d rate / d raw_log_rate = rate`，
+不再受 `(exp(-5), exp(5))` 的渐近范围约束。
 这个改变作用于所有 Poisson 后验、条件先验，以及 exact/REINFORCE/O-BBVI 路径。
 
 CTS 不再固定展开 64 项。每次采样取当前 Poisson rate 张量的最大值

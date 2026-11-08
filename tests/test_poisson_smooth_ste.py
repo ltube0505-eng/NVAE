@@ -10,7 +10,7 @@ from distributions import Poisson
 
 
 def raw_rate(rates, dtype=torch.float64):
-    return torch.tensor([5. * math.atanh(math.log(r) / 5.) for r in rates],
+    return torch.tensor([math.log(r) for r in rates],
                         dtype=dtype, requires_grad=True)
 
 
@@ -37,7 +37,7 @@ def test_forward_and_rate_jacobian_match_fixed_arrival_formula(estimator):
     actual_g = torch.autograd.grad(z.sum(), q.rate, retain_graph=True)[0]
     assert torch.allclose(actual_g, expected_g, rtol=1e-11, atol=1e-12)
     raw_g = torch.autograd.grad(z.sum(), raw)[0]
-    chain = rate * (1. - torch.tanh(raw.detach() / 5.).pow(2))
+    chain = rate
     assert torch.allclose(raw_g, expected_g * chain, rtol=1e-11, atol=1e-12)
     # In particular w(scale)=1/2, with no derivative of w entering backward.
     assert abs(w[2].item() - 0.5) < 1e-12
@@ -129,8 +129,8 @@ def test_hierarchical_fisher_uses_blended_ancestor_jacobian():
     opt.estimate_curvature([child.log_rate])
     rate = q.rate.detach()
     w = rate.pow(4) / (rate.pow(4) + 0.35 ** 4)
-    parent_chain = rate * (1. - torch.tanh(raw.detach() / 5.).pow(2))
-    child_chain = 0.7 * (1. - torch.tanh((0.7 * z.detach() + 0.2) / 5.).pow(2))
+    parent_chain = rate
+    child_chain = 0.7
     expected = child.rate.detach() * (child_chain * (1. - w) * parent_chain).pow(2)
     assert torch.allclose(opt._pending[0][1], expected, rtol=1e-12, atol=1e-12)
     assert expected.item() > 0.
