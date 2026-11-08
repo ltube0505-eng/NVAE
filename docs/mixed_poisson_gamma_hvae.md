@@ -73,7 +73,7 @@ $$
 - 生成：所有 Poisson 先验均使用精确 `torch.poisson` 采样。
 - 条件 KL：始终使用解析式。
 
-Poisson rate 保留 `exp(5*tanh(raw_log_rate/5))` 平滑参数化，已移除 rate=30 的硬截断。
+Poisson rate 使用 `exp(raw_log_rate)`，已去除 tanh 变换和 rate=30 的硬截断。
 CTS 项数按当前 rate、温度及 `poisson_cts_tail_tolerance`（默认 `1e-4`）自动决定，
 并持续追加到达事件直至越过尾项控制时间。训练 hard count 不再被有限项数封顶；
 soft count 的遗漏尾项期望按每坐标控制。完整公式与兼容说明见

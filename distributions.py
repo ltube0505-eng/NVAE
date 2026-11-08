@@ -82,9 +82,9 @@ class Poisson:
             warnings.warn('max_count and max_rate are deprecated and ignored; '
                           'CTS is adaptive and Poisson rates have no hard cap.',
                           DeprecationWarning, stacklevel=2)
-        # Preserve the smooth NVAE parameterization, but remove the hard
-        # min(log_rate, log(30)) plateau and its zero gradients.
-        self.rate = torch.exp(soft_clamp5(log_rate))
+        # Direct log-rate parameterization: lambda = exp(a), d lambda / d a = lambda.
+        # No tanh compression or hard rate cap is applied to Poisson latents.
+        self.rate = torch.exp(log_rate)
         # Keep log_p and the analytic KL exactly consistent with ``rate``.
         self.log_rate = torch.log(self.rate)
         self.relaxation_temperature = relaxation_temperature

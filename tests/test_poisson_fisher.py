@@ -3,19 +3,20 @@ import copy
 import pytest
 import torch
 
+from distributions import Poisson
 from poisson_fisher import PoissonDiagonalFisher
 
 
 def log_rate(raw):
-    return 5 * torch.tanh(raw / 5)
+    return Poisson(raw).log_rate
 
 
-def test_scalar_fisher_and_step_match_analytic_tanh_metric():
+def test_scalar_fisher_and_step_match_analytic_exponential_metric():
     raw = torch.nn.Parameter(torch.tensor([[-4., 0., 4.]], dtype=torch.double))
     opt = PoissonDiagonalFisher([raw], lr=0.01, damping=0.01, step_budget=10.)
     eta = log_rate(raw)
     rate = eta.exp()
-    expected_fisher = rate.detach() * (1 - torch.tanh(raw.detach() / 5).pow(2)).pow(2)
+    expected_fisher = rate.detach()
     before = raw.detach().clone()
     rng = torch.random.get_rng_state()
     opt.estimate_curvature([eta])
@@ -36,7 +37,7 @@ def test_shared_parameter_fisher_is_batch_mean_not_squared_mean():
     eta = log_rate(raw * inputs)
     opt = PoissonDiagonalFisher([raw], probes=4000)
     expected = (eta.detach().exp() *
-                (inputs * (1 - torch.tanh(raw.detach() * inputs / 5).pow(2))).pow(2)).mean()
+                inputs.pow(2)).mean()
     opt.estimate_curvature([eta])
     assert torch.allclose(opt._pending[0][1], expected, rtol=0.06)
 

@@ -30,7 +30,7 @@ class PoissonDiagonalFisher(Optimizer):
     def estimate_curvature(self, log_rates, distributed=False):
         """Estimate diag(J^T diag(rate) J)/batch with independent sign probes.
 
-        log_rates are the differentiable post-tanh log rates from this forward.
+        log_rates are the differentiable Poisson log rates from this forward.
         Neither probes nor rate weights are differentiated. Squaring happens
         before rank averaging. This consumes no .grad buffers and retains the
         loss graph for the ordinary backward pass.

@@ -8,23 +8,24 @@ from distributions import Poisson
 
 
 def _raw_log_rate(rate):
-    # Invert the retained smooth log-rate parameterization for test inputs.
-    return 5. * math.atanh(math.log(rate) / 5.)
+    # Direct exponential parameterization: raw = log(rate).
+    return math.log(rate)
 
 
 def test_rate_above_old_cap_has_nonzero_gradient_and_consistent_density():
-    raw = torch.tensor([5., 8.], dtype=torch.float64, requires_grad=True)
+    raw = torch.tensor([-8., -5., 0., 5., 8.], dtype=torch.float64, requires_grad=True)
     q = Poisson(raw)
-    assert (q.rate > 30.).all()
-    expected = torch.exp(5. * torch.tanh(raw / 5.))
+    assert q.rate[0] < math.exp(-5.)
+    assert q.rate[-1] > math.exp(5.)
+    expected = torch.exp(raw)
     assert torch.allclose(q.rate, expected)
-    counts = torch.tensor([40., 100.], dtype=torch.float64)
+    counts = torch.tensor([0., 0., 1., 150., 3000.], dtype=torch.float64)
     assert torch.allclose(q.log_p(counts), torch.distributions.Poisson(q.rate).log_prob(counts))
     p = Poisson(torch.zeros_like(raw))
     assert torch.allclose(q.kl(p), torch.distributions.kl_divergence(
         torch.distributions.Poisson(q.rate), torch.distributions.Poisson(p.rate)))
     q.rate.sum().backward()
-    assert (raw.grad > 0.).all()
+    assert torch.allclose(raw.grad, q.rate.detach(), rtol=1e-12, atol=0.)
 
 
 def test_legacy_caps_are_ignored():

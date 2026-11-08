@@ -3,7 +3,21 @@
 At small rates, the CTS derivative can be almost zero on most arrival paths,
 with rare large values. This experiment blends its rate derivative with the
 constant STE derivative 1. It retains the adaptive arrival sampler and the
-existing rate parameterization `lambda = exp(5 * tanh(a / 5))`.
+direct rate parameterization `lambda = exp(a)` on this branch.
+
+## Direct exponential rates and checkpoint compatibility
+
+This branch removes `5*tanh(a/5)` for every Poisson posterior and prior, using
+`lambda = exp(a)` in training, evaluation, and generation. Normal/Gamma mappings
+are unchanged. The fixed top prior remains Poisson(1). No replacement cap or
+clamp is introduced. Large positive raw outputs can overflow or make adaptive
+CTS expensive; very negative outputs can underflow in finite precision.
+
+Old state_dicts still load, but the same weights now produce different rates.
+Use a new run directory for this experiment; old checkpoints do not reproduce
+their original predictions on this branch. When initializing from a tanh-rate
+checkpoint, reset the optimizer with `--reset_optimizer` to re-estimate the Fisher
+EMA under the new mapping. Use the original branch to evaluate the old model.
 
 ## Algorithm
 
@@ -41,21 +55,22 @@ z = forward_count.detach() + (surrogate - surrogate.detach())
 ```
 
 `forward_count` is the hard integer count for `straight_through`, or the original
-soft count for `relaxed`. The forward value and RNG stream are unchanged.
+soft count for `relaxed`. At a fixed rate, enabling the blend leaves the forward
+value and RNG stream unchanged.
 Detaching the weight is essential: differentiating it would add the undesired
 `w'(lambda) * (soft_count - lambda)` term. Half/bfloat16 weights are calculated
 in FP32 and then cast back, avoiding overflow from explicitly taking powers.
 The custom backward is a first-order surrogate, not the true derivative of the
 stored hard forward value; ordinary finite-difference gradcheck is inappropriate.
 
-The derivative with respect to the raw encoder output remains
+The derivative with respect to the raw encoder output is
 
 ```text
-d z / d a = G_blend * lambda * sech(a/5)**2
+d z / d a = G_blend * lambda
 ```
 
-Thus `G_blend -> 1` at small rates does not make the raw-output derivative 1,
-remove the tanh Jacobian, or guarantee recovery of saturated/collapsed units.
+Thus `G_blend -> 1` at small rates does not make the raw-output derivative 1
+or guarantee recovery of collapsed units. The tanh Jacobian has been removed.
 
 ## Statistical interpretation and Fisher interaction
 
@@ -103,10 +118,11 @@ original CTS backward. The option also supports relaxed sampling and Adamax;
 in a mixed Poisson/Gamma model it only changes the Poisson groups. The model
 rejects it for normal-only latents and score-function estimators.
 
-All new configuration values are saved in checkpoint args by the existing
+All blend configuration values are saved in checkpoint args by the existing
 training code. No model parameters or buffers are added. Old checkpoints without
-these args default to the original backward; evaluation's exact sampler is
-unchanged. When resuming training, pass the desired CLI blend settings again,
+these args default to the original CTS backward; evaluation still uses exact
+sampling, with this branch's new exponential rates. When resuming training,
+pass the desired CLI blend settings again,
 as the existing training entry builds its model from current CLI args. For a
 new Fisher experiment initialized from an old checkpoint, use a separate save
 directory and consider `--reset_optimizer` so the curvature EMA is re-estimated
@@ -116,7 +132,7 @@ and optimizer state. See the Fisher notes for scheduler/resume semantics.
 ## Validation
 
 Run `OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python -m pytest -q tests`.
-Tests cover the analytical blended rate derivative and tanh chain rule on fixed
+Tests cover the analytical blended rate derivative and exponential chain rule on fixed
 arrival paths, unchanged forward samples and RNG, empirical variance contraction,
 direct KL gradients, exact/score sampling, low-precision weight stability,
 CLI-to-model wiring, old state_dict loading, invalid configurations, the
@@ -180,7 +196,8 @@ The fixed prior for group 0 has rate 1. A disconnected gradient is marked with
 `grad_monitor/.../connected=0`. Nonfinite coordinate points are omitted and
 counted in `grad_monitor/positions/{view}/.../nonfinite_fraction`. Under
 `grad_monitor/`, the scalar tags also include the actual CTS horizon and term
-count for each posterior group, the near-zero tanh slope fraction, the loss
+count for each posterior group, the local rate derivative `state/{q0,q1,p1}/drate_draw`
+(equal to the rate), the loss
 components, and the current Fisher quadratic step and step scale. With
 `--grad-summary`, tensor summaries are added and finite-value histograms follow
 `--grad-hist-every` (0 disables histograms).

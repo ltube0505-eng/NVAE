@@ -1,14 +1,14 @@
-# Poisson diagonal Fisher training with the original tanh rate
+# Poisson diagonal Fisher training with direct exponential rates
 
 This experiment addresses slow low-rate updates by changing the weight-space
-optimizer. The forward mapping remains exactly
+optimizer. The Poisson forward mapping on this branch is
 
-    eta = 5 * tanh(a / 5)
+    eta = a
     lambda = exp(eta)
 
 Adaptive CTS, exact hard counts, analytic KL, and the model state_dict layout
 remain compatible with the base branch. There is no added hard rate cap.
-The smooth mapping still has asymptotic bounds exp(-5) and exp(5).
+There are no tanh-induced bounds at exp(-5) or exp(5).
 
 ## Metric and algorithm
 
@@ -18,8 +18,8 @@ Tikhonov damping and controlled updates (especially Sections 10–12). This PR i
 an explicitly approximate Poisson-output implementation, not a reproduction of
 full natural-gradient optimization of NVAE's marginal likelihood.
 
-For a scalar raw output, h = sech(a/5)^2 and the Poisson Fisher is
-F_a = lambda * h^2. Dividing only by lambda would miss the tanh Jacobian.
+For a scalar raw log-rate output, d eta / d a = 1 and the Poisson Fisher is
+F_a = lambda. The tanh Jacobian is no longer present.
 For network weights theta, collect all trainable posterior and conditional-prior
 log-rate tensors from the existing forward (the fixed top prior contributes zero).
 Let eta concatenate these tensors and J = d eta / d theta. Define
@@ -66,7 +66,7 @@ or a guaranteed ELBO decrease. Damping is fixed/configurable, not an adaptive
 Levenberg–Marquardt acceptance/rejection rule. Diagonalization, damping, finite
 steps and the surrogate Jacobian all limit reparameterization invariance.
 This optimizer does not guarantee recovery of saturated units or eliminate
-posterior collapse. Forward tanh can still have zero derivative at finite precision.
+posterior collapse. Very small rates still give very small d lambda / d a.
 
 ## Training
 
@@ -108,7 +108,7 @@ validation is still required on the production PyTorch 1.6/CUDA environment.
 ## Checkpoints
 
 Same-optimizer continuation restores the Fisher EMA from the ordinary optimizer
-state_dict. Evaluation uses the unchanged forward/model state and collects no
+state_dict. Evaluation uses the same exponential rate mapping and collects no
 curvature tensors. Old checkpoint args without `optimizer` mean Adamax.
 
 To initialize a Fisher experiment from an Adamax checkpoint, copy that checkpoint
@@ -121,7 +121,7 @@ training or extend the saved scheduler horizon automatically.
 ## Validation
 
 `python -m pytest -q tests/test_poisson_fisher.py` checks the analytical scalar
-Fisher including tanh, shared-weight/batch normalization of the estimator, actual
+Fisher for direct log rates, shared-weight/batch normalization of the estimator, actual
 step budget, identity fallback, checkpoint EMA continuity, nonfinite rejection,
 and a small CPU Poisson AutoEncoder forward/backward/update. The tests do not
 establish final NELBO/FID improvement or CUDA multi-GPU performance.
