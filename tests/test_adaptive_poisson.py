@@ -8,15 +8,14 @@ from distributions import Poisson
 
 
 def _raw_log_rate(rate):
-    # Invert the retained smooth log-rate parameterization for test inputs.
-    return 5. * math.atanh(math.log(rate) / 5.)
+    return math.log(rate)
 
 
 def test_rate_above_old_cap_has_nonzero_gradient_and_consistent_density():
     raw = torch.tensor([5., 8.], dtype=torch.float64, requires_grad=True)
     q = Poisson(raw)
     assert (q.rate > 30.).all()
-    expected = torch.exp(5. * torch.tanh(raw / 5.))
+    expected = torch.exp(raw)
     assert torch.allclose(q.rate, expected)
     counts = torch.tensor([40., 100.], dtype=torch.float64)
     assert torch.allclose(q.log_p(counts), torch.distributions.Poisson(q.rate).log_prob(counts))
@@ -24,7 +23,7 @@ def test_rate_above_old_cap_has_nonzero_gradient_and_consistent_density():
     assert torch.allclose(q.kl(p), torch.distributions.kl_divergence(
         torch.distributions.Poisson(q.rate), torch.distributions.Poisson(p.rate)))
     q.rate.sum().backward()
-    assert (raw.grad > 0.).all()
+    assert torch.allclose(raw.grad, expected)
 
 
 def test_legacy_caps_are_ignored():
@@ -78,22 +77,65 @@ def test_insufficient_budget_extends_same_arrivals_and_keeps_gradients():
     assert (actual_grad > 0.).all()
 
 
-def test_st_and_relaxed_share_samples_and_backward_path():
-    raw = torch.tensor([0., 5., 8.], requires_grad=True)
+@pytest.mark.parametrize('legacy_alias', [False, True])
+def test_st_exact_forward_identity_rate_gradient_and_raw_chain_rule(legacy_alias):
+    raw = torch.tensor([-12., -1., 0., 5., 8.], dtype=torch.float64, requires_grad=True)
     q = Poisson(raw)
     torch.manual_seed(42)
-    hard, soft = q._arrival_counts()
+    expected = torch.poisson(q.rate.detach())
     torch.manual_seed(42)
-    st, _ = q.sample(estimator='straight_through')
+    with patch.object(q, '_arrival_counts', side_effect=AssertionError('STE must bypass CTS')):
+        st, _ = q.sample(relaxed=True) if legacy_alias else q.sample(estimator='straight_through')
+    assert torch.equal(st.detach(), expected)
+    assert torch.equal(st.detach(), st.detach().round())
+    # A nonconstant upstream gradient checks the full vector-Jacobian product.
+    weights = torch.tensor([2., -3., 0.5, 0., 4.], dtype=raw.dtype)
+    loss = (weights * st).sum()
+    rate_grad = torch.autograd.grad(loss, q.rate, retain_graph=True)[0]
+    raw_grad = torch.autograd.grad(loss, raw)[0]
+    assert torch.equal(rate_grad, weights)
+    assert torch.allclose(raw_grad, weights * q.rate.detach())
+    assert q.last_cts_num_terms is None and q.last_cts_horizon is None
+
+
+def test_st_is_independent_of_cts_settings():
+    raw = torch.tensor([-2., 0., 4.], requires_grad=True)
+    results = []
+    for temperature, tolerance in [(0.05, 1e-2), (1., 1e-6)]:
+        q = Poisson(raw, relaxation_temperature=temperature, cts_tail_tolerance=tolerance)
+        torch.manual_seed(17)
+        z, _ = q.sample(estimator='straight_through')
+        results.append((z.detach(), torch.autograd.grad(z.sum(), raw)[0]))
+    assert all(torch.equal(a, b) for a, b in zip(*results))
+
+
+def test_relaxed_still_uses_cts():
+    raw = torch.tensor([-1., 0., 3.], requires_grad=True)
+    q = Poisson(raw)
+    torch.manual_seed(42)
+    _, soft = q._arrival_counts()
     torch.manual_seed(42)
     relaxed, _ = q.sample(estimator='relaxed')
-    assert torch.equal(st.detach(), hard)
-    assert torch.equal(st.detach(), st.detach().round())
     assert torch.equal(relaxed, soft)
-    st_grad = torch.autograd.grad(st.sum(), raw, retain_graph=True)[0]
-    soft_grad = torch.autograd.grad(soft.sum(), raw)[0]
-    assert torch.equal(st_grad, soft_grad)
-    assert torch.isfinite(st_grad).all() and (st_grad > 0.).all()
+    actual = torch.autograd.grad(relaxed.sum(), raw, retain_graph=True)[0]
+    expected = torch.autograd.grad(soft.sum(), raw)[0]
+    assert torch.equal(actual, expected)
+    assert torch.isfinite(actual).all() and (actual > 0.).all()
+
+
+@pytest.mark.parametrize('estimator', ['straight_through', 'exact', 'reinforce'])
+def test_sampling_modes_match_poisson_moments_without_caps(estimator):
+    torch.manual_seed(2718)
+    n = 12000
+    for rate in (0.1, 1., 30., 80., 200.):
+        q = Poisson(torch.full((n,), math.log(rate)))
+        z, _ = q.sample(estimator=estimator)
+        actual_rate = q.rate[0].item()
+        assert torch.equal(z, z.round())
+        assert abs(z.mean().item() - actual_rate) < 6. * math.sqrt(actual_rate / n)
+        assert abs(z.var().item() - actual_rate) < 0.15 * actual_rate
+        if rate >= 80.:
+            assert z.mean().item() > 64.
 
 
 def test_hard_counts_match_poisson_moments_above_64():
@@ -121,10 +163,10 @@ def test_invalid_temperature(temperature):
         Poisson(torch.zeros(1), relaxation_temperature=temperature)
 
 
-def test_nonfinite_rate_fails_instead_of_looping():
-    q = Poisson(torch.tensor([float('nan')]))
-    with pytest.raises(ValueError, match='finite'):
-        q.sample(estimator='straight_through')
+@pytest.mark.parametrize('raw', [float('nan'), float('inf'), -float('inf'), 100., -110.])
+def test_invalid_rate_fails_without_silent_clamping(raw):
+    with pytest.raises(ValueError, match='finite and positive'):
+        Poisson(torch.tensor([raw], dtype=torch.float32))
 
 
 def test_empty_rate_tensor():
@@ -132,4 +174,4 @@ def test_empty_rate_tensor():
     q = Poisson(raw)
     z, _ = q.sample(estimator='straight_through')
     z.sum().backward()
-    assert z.shape == raw.shape and q.last_cts_num_terms == 0
+    assert z.shape == raw.shape and q.last_cts_num_terms is None
