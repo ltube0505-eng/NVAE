@@ -11,11 +11,11 @@
 | 取值 | 前向 latent | 后向估计 | 是否无偏估计离散目标 |
 | --- | --- | --- | --- |
 | `relaxed` | 连续 soft count | 到达时间的路径梯度 | 否，优化连续松弛目标 |
-| `straight_through` | 整数 hard count | soft count 的路径梯度 | 否，hard-forward/soft-backward |
+| `straight_through` | 精确 Poisson 整数样本 | rate 空间恒等 STE：`dz/drate = 1` | 否，有偏直通估计 |
 | `reinforce` | 从后验精确采样的整数 | score function + 上一批次 EMA baseline | 是 |
 | `obbvi` | 从过度离散 proposal 精确采样的整数 | DMIS importance-weighted score function + EMA baseline | 是（支撑覆盖且矩存在时） |
 
-`relaxed` 与 `straight_through` 使用同一组指数到达时间
+只有 `relaxed` 使用指数到达时间
 
 \[
 E_k\sim\operatorname{Exp}(\lambda),\qquad
@@ -29,19 +29,37 @@ T_k=\sum_{j\le k}E_j,
 \sigma\!\left(\frac{1-T_k}{t}\right).
 \]
 
-- `relaxed` 直接把 \(\widetilde z\) 送入 decoder；
-- `straight_through` 的实际张量为
-  \(z_{\rm hard}+\widetilde z-\operatorname{stopgrad}(\widetilde z)\)，所以前向是整数、反向使用松弛梯度。
+`relaxed` 直接把 \(\widetilde z\) 送入 decoder。
 
-这一区分与 NegBio-VAE 中 Poisson/Gamma-arrival 松弛的语义一致，避免把“连续松弛”和“straight-through”误称为同一种估计器。
+`straight_through` 改用精确 `torch.poisson(rate.detach())` 样本，实际张量为
+
+\[
+z_{\rm STE}=z_{\rm hard}+
+\bigl(\lambda-\operatorname{stopgrad}(\lambda)\bigr),\qquad
+z_{\rm hard}\sim\operatorname{Poisson}(\lambda).
+\]
+
+括号中的项前向严格为零，因此保留整数值；反向使用
+\(\partial z_{\rm STE}/\partial\lambda=1\)，而非 CTS 软计数导数。
+STE 不计算到达时间，不依赖温度或尾项容差；旧的 `sample(relaxed=True)`
+兼容入口仍映射到 `straight_through`，所以也采用新的恒等 STE。
 
 ### 自适应 CTS 与移除硬截断
 
-Poisson rate 现在为 `exp(5 * tanh(raw_log_rate / 5))`，移除了原来的
-`clamp(max=log(30))`。因此 rate 超过 30 后仍能回传梯度。保留原有平滑
-参数化意味着 rate 仍处于约 `(exp(-5), exp(5))`，并非无界指数参数化。
-这个改变作用于所有 Poisson 后验、条件先验，以及 exact/REINFORCE/O-BBVI 路径。
+本分支进一步移除 Poisson 的 `5*tanh(a/5)` 软截断，直接使用
+\(\lambda=\exp(a)\)、\(\log\lambda=a\)。因此
 
+\[
+\frac{\partial\lambda}{\partial a}=\lambda,\qquad
+\frac{\partial z_{\rm STE}}{\partial a}=\lambda.
+\]
+
+这作用于所有 Poisson 后验、条件先验及所有估计器；固定零 log-rate 先验仍为
+Poisson(1)。Normal/Gamma 的参数化不变，解析 Poisson KL 仍正常反传。
+rate 没有硬上限或软上限；若指数运算溢出、下溢到零或产生非有限值，显式报错，
+不偷偷截断。有限 rate 也可能产生很大的 KL 或梯度，需要通过训练监控判断稳定性。
+
+下面的自适应 CTS 仅用于显式 `relaxed` 模式。
 CTS 不再固定展开 64 项。每次采样取当前 Poisson rate 张量的最大值
 `lambda_max`（同一次 group 调用中的 batch、通道、空间位置共享项数），
 记 sigmoid 温度为 `t`、`--poisson_cts_tail_tolerance` 为 `eps`（默认 `1e-4`）：
@@ -67,16 +85,17 @@ M 是按当前参数选择的初始预算，不是硬计数上限。`H >= 1` 保
 \]
 
 实际计算会包含越过 H 的到达项，因此该界是保守的。这是**每个坐标的软计数
-尾项期望界**，不是整批误差界、逐样本绝对误差界或梯度偏差界；ST 仍然有偏。
+尾项期望界**，不是整批误差界、逐样本绝对误差界或梯度偏差界；恒等 STE 也仍然有偏。
 规划和停止判断不参与 autograd；已采样到达时间及其软计数保持路径梯度。
-可读取分布对象的 `last_cts_num_terms`、`last_cts_horizon` 检查最近一次采样，
-这两个字段不是自动写入 TensorBoard 的指标。
+可读取分布对象的 `last_cts_num_terms`、`last_cts_horizon` 检查最近一次 CTS 采样，
+新建分布只调用 STE 时两者保持 `None`；这两个字段不是自动写入 TensorBoard 的指标。
 
 旧命令行 `--poisson_max_count`、`--poisson_max_rate` 仍可解析，但已弃用且忽略；
 直接调用 `Poisson(..., max_count=..., max_rate=...)` 也只保留兼容入口。
-旧 checkpoint 缺少新字段时默认采用 `1e-4`，权重形状不变，但超过旧 rate 上限的
-分布及采样行为会改变，不能用本分支复现旧版的封顶评估结果。
-较大的 rate、温度或更严格的容差会增加采样项数、显存和计算量；规划和停止检查
+旧 checkpoint 缺少新字段时默认采用 `1e-4`，权重形状不变，但直接指数参数化
+会改变非零 raw log-rate 对应的分布；继续训练也会采用新的 STE 梯度。不能将
+旧 checkpoint 的本分支评估结果当作旧参数化下的复现结果。
+在 `relaxed` 模式，较大的 rate、温度或更严格的容差会增加采样项数、显存和计算量；规划和停止检查
 还会触发设备同步。没有另外设置隐藏的最大项数。
 
 ## 2. REINFORCE 目标
@@ -210,7 +229,8 @@ OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python -m pytest -q
 
 自适应 CTS 的回归测试另覆盖：超过 30 的 rate 梯度和密度一致性、超过 64 的
 硬计数及 Poisson 均值/方差、项数对 rate/温度/容差的响应、软计数期望尾界、
-强制追加采样时的到达连续性和梯度、ST/relaxed 共用噪声及相同反向路径、
+强制追加采样时的到达连续性和梯度、STE 精确整数前向及任意上游梯度的恒等回传、
+raw 空间的指数链式梯度、STE 绕过 CTS 且不依赖 CTS 设置、
 旧参数兼容、空张量和非法参数，以及模型后验/先验的新参数传递。
 
 

@@ -98,7 +98,8 @@ def test_adaptive_cts_config_reaches_posterior_and_prior_with_legacy_args():
     param = torch.full((1, 4, 2, 2), 8.)
     q = model._latent_from_param(0, param)
     p = model._fixed_prior(0, param[:, :2])
-    assert (q.rate > 30.).all()
+    assert torch.allclose(q.rate, torch.exp(param[:, :2]))
+    assert torch.equal(p.rate, torch.ones_like(p.rate))
     assert q.cts_tail_tolerance == p.cts_tail_tolerance == 1e-4
     model.poisson_cts_tail_tolerance = 1e-6
     q = model._latent_from_param(0, param)

@@ -446,11 +446,12 @@ if __name__ == '__main__':
                         help='latent family; poisson makes every latent group Poisson')
     parser.add_argument('--poisson_gradient_estimator', type=str, default='straight_through',
                         choices=['relaxed', 'reinforce', 'obbvi', 'straight_through'],
-                        help='gradient estimator used by Poisson latent groups')
+                        help='gradient estimator used by Poisson latent groups; '
+                             'straight_through uses identity dz/drate=1')
     parser.add_argument('--poisson_relaxation_temperature', type=float, default=0.1,
-                        help='sigmoid temperature for relaxed/ST Poisson arrival indicators')
+                        help='sigmoid temperature for relaxed Poisson arrivals (unused by STE)')
     parser.add_argument('--poisson_cts_tail_tolerance', type=float, default=1e-4,
-                        help='per-coordinate expected omitted CTS soft-count tolerance; '
+                        help='relaxed mode only: per-coordinate expected omitted CTS soft-count tolerance; '
                              'term count adapts to current rates and temperature')
     parser.add_argument('--poisson_max_count', type=int, default=None,
                         help='deprecated and ignored; CTS term count is adaptive')

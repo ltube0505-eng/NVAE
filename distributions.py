@@ -57,8 +57,9 @@ class Poisson:
     """Poisson latent with exact, relaxed, ST, and O-BBVI sampling helpers.
 
     ``relaxed`` uses the exponential-arrival construction used by PoissonVAE
-    and NegBio-VAE.  ``straight_through`` has an integer forward value and the
-    same relaxed backward path.  Score-function estimators use ``exact``.
+    and NegBio-VAE. ``straight_through`` samples an exact integer count and
+    uses the identity surrogate dz/drate = 1, without computing CTS arrivals.
+    Score-function estimators use ``exact``.
 
     For O-BBVI, a dispersion coefficient ``tau`` defines the proposal
     ``Poisson(rate ** (1 / tau))``.  This is the overdispersed exponential-
@@ -76,11 +77,13 @@ class Poisson:
             warnings.warn('max_count and max_rate are deprecated and ignored; '
                           'CTS is adaptive and Poisson rates have no hard cap.',
                           DeprecationWarning, stacklevel=2)
-        # Preserve the smooth NVAE parameterization, but remove the hard
-        # min(log_rate, log(30)) plateau and its zero gradients.
-        self.rate = torch.exp(soft_clamp5(log_rate))
-        # Keep log_p and the analytic KL exactly consistent with ``rate``.
-        self.log_rate = torch.log(self.rate)
+        # Unbounded log-rate parameterization: lambda = exp(a), d lambda/da = lambda.
+        # Fail explicitly on floating-point overflow/underflow; do not add a cap.
+        self.log_rate = log_rate
+        self.rate = torch.exp(log_rate)
+        if not bool((torch.isfinite(self.rate) & (self.rate > 0.)).all().item()):
+            raise ValueError('Poisson exp(log_rate) must be finite and positive; '
+                             'check log_rate for overflow or underflow.')
         self.relaxation_temperature = relaxation_temperature
         self.cts_tail_tolerance = cts_tail_tolerance
         self.last_cts_num_terms = None
@@ -153,14 +156,15 @@ class Poisson:
                 raise ValueError('proposal_tau is required for O-BBVI sampling.')
             return torch.poisson(self.proposal_rate(proposal_tau)), None
 
-        hard_count, soft_count = self._arrival_counts()
-        if estimator == 'relaxed':
-            return soft_count, None
         if estimator == 'straight_through':
+            hard_count = torch.poisson(self.rate.detach())
             # Parenthesize the zero-valued term so the stored forward value is
             # bit-for-bit the integer hard count (not hard + round-off noise).
-            count = hard_count + (soft_count - soft_count.detach())
+            count = hard_count + (self.rate - self.rate.detach())
             return count, None
+        if estimator == 'relaxed':
+            _, soft_count = self._arrival_counts()
+            return soft_count, None
         raise ValueError('Unknown Poisson estimator: %s' % estimator)
 
     def log_p(self, samples):
