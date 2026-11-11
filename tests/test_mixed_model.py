@@ -1,10 +1,13 @@
 from types import SimpleNamespace
+from unittest.mock import patch
 
+import pytest
 import torch
 from torch.distributions.bernoulli import Bernoulli
 
 from model import AutoEncoder
 import utils
+from distributions import Poisson
 
 
 def _args():
@@ -146,4 +149,89 @@ def test_obbvi_model_uses_bounded_dmis_weight():
     assert torch.isfinite(objective).all()
     assert torch.isfinite(weight).all()
     assert torch.max(weight) <= len(model.obbvi_taus) + 1e-5
+
+
+def _vanilla_model(blocks=3, cells=2, latent_distribution='poisson'):
+    args = _args()
+    args.latent_distribution = latent_distribution
+    args.num_latent_scales = args.num_groups_per_scale = 1
+    args.ada_groups = False
+    args.min_groups_per_scale = 1
+    args.num_preprocess_blocks = args.num_postprocess_blocks = blocks
+    args.num_preprocess_cells = args.num_postprocess_cells = cells
+    model = AutoEncoder(args, None, utils.get_arch_cells('res_elu'))
+    for module in model.modules():
+        if hasattr(module, 'init_done'):
+            module.init_done = True
+    return model
+
+
+@pytest.mark.parametrize('blocks,cells', [(2, 3), (3, 2)])
+def test_vanilla_topology_and_prior_initialization(blocks, cells):
+    model = _vanilla_model(blocks, cells)
+    assert model.vanilla_vae
+    assert len(model.enc_tower) == len(model.dec_tower) == 0
+    assert len(model.pre_process) == len(model.post_process) == blocks * cells
+    assert sum(c.cell_type == 'down_pre' for c in model.pre_process) == blocks
+    assert sum(c.cell_type == 'up_post' for c in model.post_process) == blocks
+    assert model.prior_log_rate.shape == (1, 2, 32 // 2 ** blocks, 32 // 2 ** blocks)
+    reference = torch.zeros([3] + model.z0_size)
+    prior = model._prior0(reference)
+    fixed = model._fixed_prior(0, reference)
+    assert torch.equal(prior.rate, fixed.rate)
+    assert torch.equal(prior.log_p(reference), fixed.log_p(reference))
+
+
+def test_vanilla_forward_prior_gradient_and_optimizer_update():
+    model = _vanilla_model().train()
+    q = Poisson(torch.full([2] + model.z0_size, 0.7, requires_grad=True))
+    optimizer = torch.optim.Adamax(model.parameters(), lr=0.01)
+    with patch.object(model, '_latent_from_param', return_value=q), \
+            patch.object(model, '_sample_latent', wraps=model._sample_latent) as sampler:
+        logits, _, log_p, kl_all, _ = model(torch.rand(2, 1, 32, 32))
+    assert logits.shape == (2, 1, 32, 32)
+    assert len(kl_all) == 1
+    assert sampler.call_count == 1
+    # At initialization the analytic KL is q*log(q) + 1 - q.
+    expected_kl = (q.rate * q.log_rate + 1. - q.rate).sum(dim=[1, 2, 3])
+    assert torch.allclose(kl_all[0], expected_kl)
+    assert torch.isfinite(log_p).all()
+    kl_all[0].mean().backward()
+    expected_grad = (1. - q.rate.detach()).mean(dim=0, keepdim=True)
+    assert torch.allclose(model.prior_log_rate.grad, expected_grad)
+    optimizer.step()
+    assert (model.prior_log_rate > 0.).all()
+
+
+def test_vanilla_learned_prior_used_by_forward_sampling_and_checkpoint():
+    model = _vanilla_model().eval()
+    with torch.no_grad():
+        model.prior_log_rate.copy_(torch.linspace(-0.5, 1., model.prior_log_rate.numel())
+                                   .reshape_as(model.prior_log_rate))
+    reference = torch.zeros([2] + model.z0_size)
+    expected_rate = model.prior_log_rate.exp().expand_as(reference)
+    # Keep posterior samples deterministic so log_p can be checked independently.
+    z = torch.ones_like(reference)
+    with patch.object(model, '_sample_latent', return_value=(z, None)):
+        _, _, log_p, _, _ = model(torch.rand(2, 1, 32, 32))
+    expected_log_p = torch.distributions.Poisson(expected_rate).log_prob(z).sum(dim=[1, 2, 3])
+    assert torch.allclose(log_p, expected_log_p)
+    with torch.no_grad(), patch('torch.poisson', wraps=torch.poisson) as sampler:
+        logits = model.sample(2, t=1.)
+    assert logits.shape == (2, 1, 32, 32)
+    assert torch.isfinite(logits).all()
+    sampler.assert_called_once()
+    assert torch.equal(sampler.call_args[0][0], expected_rate)
+    restored = _vanilla_model()
+    restored.load_state_dict(model.state_dict(), strict=True)
+    assert torch.equal(restored._prior0(reference).rate, expected_rate)
+
+
+def test_other_topologies_and_normal_prior_remain_fixed():
+    for model in (_poisson_model(), _model(), _vanilla_model(latent_distribution='normal')):
+        assert model.prior_log_rate is None
+        assert 'prior_log_rate' not in model.state_dict()
+        reference = torch.zeros([2] + model.z0_size)
+        assert torch.equal(model._prior0(reference).log_p(reference),
+                           model._fixed_prior(0, reference).log_p(reference))
 
