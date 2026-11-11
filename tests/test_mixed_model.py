@@ -151,7 +151,7 @@ def test_obbvi_model_uses_bounded_dmis_weight():
     assert torch.max(weight) <= len(model.obbvi_taus) + 1e-5
 
 
-def _vanilla_model(blocks=3, cells=2, latent_distribution='poisson'):
+def _vanilla_model(blocks=3, cells=2, latent_distribution='poisson', **overrides):
     args = _args()
     args.latent_distribution = latent_distribution
     args.num_latent_scales = args.num_groups_per_scale = 1
@@ -159,11 +159,49 @@ def _vanilla_model(blocks=3, cells=2, latent_distribution='poisson'):
     args.min_groups_per_scale = 1
     args.num_preprocess_blocks = args.num_postprocess_blocks = blocks
     args.num_preprocess_cells = args.num_postprocess_cells = cells
+    vars(args).update(overrides)
     model = AutoEncoder(args, None, utils.get_arch_cells('res_elu'))
     for module in model.modules():
         if hasattr(module, 'init_done'):
             module.init_done = True
     return model
+
+
+def test_vanilla_fixed_gaussian_reconstruction_and_sampling():
+    variance = 0.04
+    model = _vanilla_model(image_likelihood='gaussian_fixed', gaussian_variance=variance)
+    x = torch.rand(2, 1, 32, 32)
+    logits, log_q, log_p, kl_all, _ = model(x)
+    output = model.decoder_output(logits)
+    expected = torch.distributions.Normal(logits.sigmoid(), variance ** 0.5)
+    expected_recon = -expected.log_prob(x)[:, :, 2:30, 2:30].sum(dim=(1, 2, 3))
+    recon = utils.reconstruction_loss(output, x, crop=model.crop_output)
+    assert torch.allclose(recon, expected_recon)
+    assert torch.allclose(utils.log_iw(output, x, log_q, log_p, crop=model.crop_output),
+                          -expected_recon + log_p - log_q)
+    (recon + kl_all[0]).mean().backward()
+    assert torch.isfinite(model.image_conditional[-1].weight.grad).all()
+    assert torch.isfinite(model.prior_log_rate.grad).all()
+    with torch.no_grad():
+        sample = model.decoder_output(model.eval().sample(2, t=1.)).sample(t=1.)
+    assert sample.shape == x.shape
+    assert ((0. <= sample) & (sample <= 1.)).all()
+
+
+def test_mnist_transforms_preserve_grayscale_only_for_fixed_gaussian():
+    from PIL import Image
+    from datasets import _data_transforms_mnist
+
+    image = Image.new('L', (28, 28), 128)
+    args = SimpleNamespace(image_likelihood='gaussian_fixed')
+    for transform in _data_transforms_mnist(args):
+        pixels = transform(image)
+        assert pixels.shape == (1, 32, 32)
+        assert torch.allclose(pixels[:, 2:30, 2:30], torch.full((1, 28, 28), 128. / 255.))
+        assert torch.count_nonzero(pixels[:, :2, :]) == 0
+    for transform in _data_transforms_mnist(SimpleNamespace()):
+        pixels = transform(image)
+        assert ((pixels == 0.) | (pixels == 1.)).all()
 
 
 @pytest.mark.parametrize('blocks,cells', [(2, 3), (3, 2)])

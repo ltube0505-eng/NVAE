@@ -67,12 +67,18 @@ def main(args):
 
     num_output = utils.num_output(args.dataset)
     bpd_coeff = 1. / np.log(2.) / num_output
+    report_bpd = model.image_likelihood != 'gaussian_fixed'
 
     # if load
     checkpoint_file = os.path.join(args.save, 'checkpoint.pt')
     if args.cont_training:
         logging.info('loading the model.')
         checkpoint = torch.load(checkpoint_file, map_location='cpu')
+        saved_args = checkpoint['args']
+        if getattr(saved_args, 'image_likelihood', 'dataset_default') != model.image_likelihood or (
+                model.image_likelihood == 'gaussian_fixed' and
+                getattr(saved_args, 'gaussian_variance', 0.01) != model.gaussian_variance):
+            raise ValueError('Use the same image likelihood and Gaussian variance as the checkpoint when resuming.')
         init_epoch = checkpoint['epoch']
         model.load_state_dict(checkpoint['state_dict'])
         model = model.cuda()
@@ -117,12 +123,13 @@ def main(args):
             valid_neg_log_p, valid_nelbo = test(valid_queue, model, num_samples=10, args=args, logging=logging)
             logging.info('valid_nelbo %f', valid_nelbo)
             logging.info('valid neg log p %f', valid_neg_log_p)
-            logging.info('valid bpd elbo %f', valid_nelbo * bpd_coeff)
-            logging.info('valid bpd log p %f', valid_neg_log_p * bpd_coeff)
             writer.add_scalar('val/neg_log_p', valid_neg_log_p, epoch)
             writer.add_scalar('val/nelbo', valid_nelbo, epoch)
-            writer.add_scalar('val/bpd_log_p', valid_neg_log_p * bpd_coeff, epoch)
-            writer.add_scalar('val/bpd_elbo', valid_nelbo * bpd_coeff, epoch)
+            if report_bpd:
+                logging.info('valid bpd elbo %f', valid_nelbo * bpd_coeff)
+                logging.info('valid bpd log p %f', valid_neg_log_p * bpd_coeff)
+                writer.add_scalar('val/bpd_log_p', valid_neg_log_p * bpd_coeff, epoch)
+                writer.add_scalar('val/bpd_elbo', valid_nelbo * bpd_coeff, epoch)
 
         save_freq = int(np.ceil(args.epochs / 100))
         if epoch % save_freq == 0 or epoch == (args.epochs - 1):
@@ -139,8 +146,9 @@ def main(args):
     logging.info('final valid neg log p %f', valid_neg_log_p)
     writer.add_scalar('val/neg_log_p', valid_neg_log_p, epoch + 1)
     writer.add_scalar('val/nelbo', valid_nelbo, epoch + 1)
-    writer.add_scalar('val/bpd_log_p', valid_neg_log_p * bpd_coeff, epoch + 1)
-    writer.add_scalar('val/bpd_elbo', valid_nelbo * bpd_coeff, epoch + 1)
+    if report_bpd:
+        writer.add_scalar('val/bpd_log_p', valid_neg_log_p * bpd_coeff, epoch + 1)
+        writer.add_scalar('val/bpd_elbo', valid_nelbo * bpd_coeff, epoch + 1)
     writer.close()
 
 
@@ -487,6 +495,11 @@ if __name__ == '__main__':
                         help='number of cells per block')
     parser.add_argument('--num_cell_per_cond_dec', type=int, default=1,
                         help='number of cell for each conditional in decoder')
+    parser.add_argument('--image_likelihood', choices=['dataset_default', 'gaussian_fixed'],
+                        default='dataset_default',
+                        help='Use a fixed-variance Gaussian pixel density for grayscale MNIST.')
+    parser.add_argument('--gaussian_variance', type=float, default=0.01,
+                        help='Fixed Gaussian observation variance in [0, 1] pixel units.')
     parser.add_argument('--num_mixture_dec', type=int, default=10,
                         help='number of mixture components in decoder. set to 1 for Normal decoder.')
     # NAS

@@ -124,6 +124,20 @@ python train.py --data $DATA_DIR/mnist --root $CHECKPOINT_DIR --save $EXPR_ID --
         --num_postprocess_blocks 2 --weight_decay_norm 1e-2 --num_channels_enc 32 --num_channels_dec 32 --num_nf 0 \
         --ada_groups --num_process_per_node 2 --use_se --res_dist --fast_adamax 
 ```
+
+To train MNIST with a fixed-variance Gaussian image likelihood, add
+`--image_likelihood gaussian_fixed --gaussian_variance 0.01` to the training
+command. Training and validation then use grayscale pixels in `[0, 1]`.
+The decoder predicts a sigmoid mean per pixel, with one fixed variance shared
+across all pixels. A variance of 0.01 gives a standard deviation of 0.1.
+The Poisson latent distributions and learnable prior use the same configuration
+as before.
+
+Evaluation restores the image likelihood from the checkpoint and reports
+Gaussian NELBO and negative log density in nats per image. These values use
+grayscale densities and cannot be compared directly with binarized MNIST NLL
+or bits per dimension. Use a new experiment name to train with this likelihood,
+and keep the likelihood and variance flags the same when resuming it.
 </details>
 
 <details><summary>CIFAR-10</summary>
