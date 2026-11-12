@@ -133,6 +133,12 @@ across all pixels. A variance of 0.01 gives a standard deviation of 0.1.
 The Poisson latent distributions and learnable prior use the same configuration
 as before.
 
+Generated images, reconstruction previews, and exported Gaussian images display
+`mu_theta(z)` after sampling the latent `z`; no observation noise is added.
+The fixed Gaussian variance still enters the training and evaluation likelihood.
+For per-latent posterior-rate-only TensorBoard logging, replace `train.py` with
+`train_poisson_posterior_rate.py`; see [usage and resume instructions](docs/posterior_rate_monitor.md).
+
 Evaluation restores the image likelihood from the checkpoint and reports
 Gaussian NELBO and negative log density in nats per image. These values use
 grayscale densities and cannot be compared directly with binarized MNIST NLL

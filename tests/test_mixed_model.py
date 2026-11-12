@@ -183,9 +183,20 @@ def test_vanilla_fixed_gaussian_reconstruction_and_sampling():
     assert torch.isfinite(model.image_conditional[-1].weight.grad).all()
     assert torch.isfinite(model.prior_log_rate.grad).all()
     with torch.no_grad():
-        sample = model.decoder_output(model.eval().sample(2, t=1.)).sample(t=1.)
+        generated_logits = model.eval().sample(2, t=1.)
+        rng = torch.get_rng_state().clone()
+        sample = model.image_from_logits(generated_logits)
+        assert torch.equal(sample, generated_logits.sigmoid())
+        assert torch.equal(torch.get_rng_state(), rng)
+        assert torch.equal(model.image_from_logits(generated_logits, t=0.7), sample)
     assert sample.shape == x.shape
     assert ((0. <= sample) & (sample <= 1.)).all()
+
+
+def test_bernoulli_image_rendering_still_uses_mean():
+    model = _vanilla_model()
+    logits = torch.randn(2, 1, 32, 32)
+    assert torch.equal(model.image_from_logits(logits), logits.sigmoid())
 
 
 def test_mnist_transforms_preserve_grayscale_only_for_fixed_gaussian():

@@ -251,7 +251,8 @@ class FixedGaussianDecoder:
 
     @torch.no_grad()
     def sample(self, t=1.):
-        # t applies to the latent prior; clip image samples for display and export.
+        # Explicit noisy draws only. Image rendering/export uses mean(), not this method.
+        # t applies to the latent prior; retain the legacy clipped draw API here.
         return (self.loc + self.scale * torch.randn_like(self.loc)).clamp(0., 1.)
 
 

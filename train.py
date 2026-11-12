@@ -32,7 +32,14 @@ def main(args):
     torch.cuda.manual_seed_all(args.seed)
 
     logging = utils.Logger(args.global_rank, args.save)
-    writer = utils.Writer(args.global_rank, args.save)
+    rate_only = getattr(args, 'posterior_rate_only', False)
+    if rate_only:
+        from train_poisson_posterior_rate import PosteriorRateMonitor, RateOnlyWriter
+        writer = RateOnlyWriter(args.save)
+        rate_monitor = PosteriorRateMonitor(writer, args.rate_every, args.rate_position_images)
+    else:
+        writer = utils.Writer(args.global_rank, args.save)
+        rate_monitor = None
     if (getattr(args, 'poisson_max_count', None) is not None or
             getattr(args, 'poisson_max_rate', None) is not None):
         logging.info('poisson_max_count and poisson_max_rate are deprecated and ignored; '
@@ -48,6 +55,9 @@ def main(args):
 
     model = AutoEncoder(args, writer, arch_instance)
     model = model.cuda()
+
+    if rate_monitor is not None:
+        model.posterior_rate_monitor = rate_monitor
 
     logging.info('args = %s', args)
     logging.info('param size = %fM ', utils.count_parameters_in_M(model))
@@ -73,7 +83,11 @@ def main(args):
     checkpoint_file = os.path.join(args.save, 'checkpoint.pt')
     if args.cont_training:
         logging.info('loading the model.')
-        checkpoint = torch.load(checkpoint_file, map_location='cpu')
+        if rate_only:
+            from train_poisson_posterior_rate import load_checkpoint
+            checkpoint = load_checkpoint(checkpoint_file)
+        else:
+            checkpoint = torch.load(checkpoint_file, map_location='cpu')
         saved_args = checkpoint['args']
         if getattr(saved_args, 'image_likelihood', 'dataset_default') != model.image_likelihood or (
                 model.image_likelihood == 'gaussian_fixed' and
@@ -88,6 +102,9 @@ def main(args):
         global_step = checkpoint['global_step']
     else:
         global_step, init_epoch = 0, 0
+
+    if rate_only:
+        writer.open(purge_step=global_step if args.cont_training else None)
 
     for epoch in range(init_epoch, args.epochs):
         # update lrs.
@@ -115,8 +132,7 @@ def main(args):
                 n = int(np.floor(np.sqrt(num_samples)))
                 for t in [0.7, 0.8, 0.9, 1.0]:
                     logits = model.sample(num_samples, t)
-                    output = model.decoder_output(logits)
-                    output_img = output.mean if isinstance(output, torch.distributions.bernoulli.Bernoulli) else output.sample(t)
+                    output_img = model.image_from_logits(logits, t)
                     output_tiled = utils.tile_image(output_img, n)
                     writer.add_image('generated_%0.1f' % t, output_tiled, global_step)
 
@@ -175,6 +191,9 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
             utils.average_params(model.parameters(), args.distributed)
 
         cnn_optimizer.zero_grad()
+        rate_monitor = getattr(model, 'posterior_rate_monitor', None)
+        if rate_monitor is not None:
+            rate_monitor.begin(global_step)
         with autocast():
             kl_coeff = utils.kl_coeff(global_step, args.kl_anneal_portion * args.num_total_iter,
                                       args.kl_const_portion * args.num_total_iter, args.kl_const_coeff)
@@ -248,7 +267,9 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
             loss += norm_loss * wdn_coeff + bn_loss * wdn_coeff
 
         grad_scalar.scale(loss).backward()
-        utils.average_gradients(model.parameters(), args.distributed)
+        # The single-process monitor needs no reduction (vanilla has unused parameters).
+        if not getattr(args, 'posterior_rate_only', False):
+            utils.average_gradients(model.parameters(), args.distributed)
         grad_scalar.step(cnn_optimizer)
         grad_scalar.update()
         nelbo.update(reported_nelbo.data, 1)
@@ -257,7 +278,7 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
             if (global_step + 1) % 1000 == 0:  # reduced frequency
                 n = int(np.floor(np.sqrt(x.size(0))))
                 x_img = x[:n*n]
-                output_img = output.mean if isinstance(output, torch.distributions.bernoulli.Bernoulli) else output.sample()
+                output_img = model.image_from_logits(logits)
                 output_img = output_img[:n*n]
                 x_tiled = utils.tile_image(x_img, n)
                 output_tiled = utils.tile_image(output_img, n)
@@ -391,7 +412,8 @@ def cleanup():
     dist.destroy_process_group()
 
 
-if __name__ == '__main__':
+def main_cli(posterior_rate_only=False):
+    global args
     parser = argparse.ArgumentParser('encoder decoder examiner')
     # experimental results
     parser.add_argument('--root', type=str, default='/tmp/nasvae/expr',
@@ -524,7 +546,12 @@ if __name__ == '__main__':
                         help='address for master')
     parser.add_argument('--seed', type=int, default=1,
                         help='seed used for initialization')
+    if posterior_rate_only:
+        from train_poisson_posterior_rate import add_monitor_arguments, configure_args
+        add_monitor_arguments(parser)
     args = parser.parse_args()
+    if posterior_rate_only:
+        args = configure_args(args, parser)
     args.save = args.root + '/eval-' + args.save
     utils.create_exp_dir(args.save)
 
@@ -550,4 +577,8 @@ if __name__ == '__main__':
         print('starting in debug mode')
         args.distributed = True
         init_processes(0, size, main, args)
+
+
+if __name__ == '__main__':
+    main_cli()
 

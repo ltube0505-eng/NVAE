@@ -597,6 +597,11 @@ class AutoEncoder(nn.Module):
 
         logits = self.image_conditional(s)
 
+        # Observe the actual posterior rates without retaining an autograd graph.
+        rate_monitor = getattr(self, 'posterior_rate_monitor', None)
+        if self.training and rate_monitor is not None and rate_monitor.active:
+            rate_monitor.record(all_q)
+
         # compute kl
         kl_all = []
         kl_diag = []
@@ -661,6 +666,15 @@ class AutoEncoder(nn.Module):
 
         logits = self.image_conditional(s)
         return logits
+
+    def image_from_logits(self, logits, t=1.):
+        """Render Gaussian/Bernoulli means; latent samples provide randomness."""
+        output = self.decoder_output(logits)
+        if isinstance(output, FixedGaussianDecoder):
+            return output.mean()
+        if isinstance(output, Bernoulli):
+            return output.mean
+        return output.sample(t)
 
     def decoder_output(self, logits):
         if self.image_likelihood == 'gaussian_fixed':

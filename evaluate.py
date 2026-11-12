@@ -109,9 +109,7 @@ def main(eval_args):
                 start = time()
                 with autocast():
                     logits = model.sample(num_samples, eval_args.temp)
-                output = model.decoder_output(logits)
-                output_img = output.mean if isinstance(output, torch.distributions.bernoulli.Bernoulli) \
-                    else output.sample()
+                output_img = model.image_from_logits(logits)
                 torch.cuda.synchronize()
                 end = time()
                 logging.info('sampling time per batch: %0.3f sec', (end - start))
