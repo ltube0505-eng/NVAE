@@ -6,6 +6,7 @@
 # ---------------------------------------------------------------
 
 
+import math
 import time
 import numpy as np
 import torch
@@ -17,7 +18,7 @@ from neural_ar_operations import ELUConv as ARELUConv
 from torch.distributions.bernoulli import Bernoulli
 
 from utils import get_stride_for_cell_type, get_input_size, groups_per_scale
-from distributions import Normal, Poisson, Gamma, DiscMixLogistic, NormalDecoder
+from distributions import Normal, Poisson, Gamma, DiscMixLogistic, NormalDecoder, FixedGaussianDecoder
 from thirdparty.inplaced_sync_batchnorm import SyncBatchNormSwish
 
 CHANNEL_MULT = 2
@@ -111,6 +112,15 @@ class AutoEncoder(nn.Module):
         self.use_se = args.use_se
         self.res_dist = args.res_dist
         self.num_bits = args.num_x_bits
+        self.image_likelihood = getattr(args, 'image_likelihood', 'dataset_default')
+        self.gaussian_variance = getattr(args, 'gaussian_variance', 0.01)
+        if self.image_likelihood not in {'dataset_default', 'gaussian_fixed'}:
+            raise ValueError('Unknown image likelihood: %s' % self.image_likelihood)
+        if self.image_likelihood == 'gaussian_fixed':
+            if self.dataset != 'mnist':
+                raise ValueError('--image_likelihood gaussian_fixed requires --dataset mnist.')
+            if not math.isfinite(self.gaussian_variance) or self.gaussian_variance <= 0.:
+                raise ValueError('--gaussian_variance must be finite and positive.')
         self.latent_distribution = getattr(args, 'latent_distribution', 'normal')
         self.poisson_relaxation_temperature = getattr(args, 'poisson_relaxation_temperature', 0.1)
         # Legacy checkpoints may still contain max_count/max_rate; neither
@@ -587,6 +597,11 @@ class AutoEncoder(nn.Module):
 
         logits = self.image_conditional(s)
 
+        # Observe the actual posterior rates without retaining an autograd graph.
+        rate_monitor = getattr(self, 'posterior_rate_monitor', None)
+        if self.training and rate_monitor is not None and rate_monitor.active:
+            rate_monitor.record(all_q)
+
         # compute kl
         kl_all = []
         kl_diag = []
@@ -652,8 +667,19 @@ class AutoEncoder(nn.Module):
         logits = self.image_conditional(s)
         return logits
 
+    def image_from_logits(self, logits, t=1.):
+        """Render Gaussian/Bernoulli means; latent samples provide randomness."""
+        output = self.decoder_output(logits)
+        if isinstance(output, FixedGaussianDecoder):
+            return output.mean()
+        if isinstance(output, Bernoulli):
+            return output.mean
+        return output.sample(t)
+
     def decoder_output(self, logits):
-        if self.dataset in {'mnist', 'omniglot'}:
+        if self.image_likelihood == 'gaussian_fixed':
+            return FixedGaussianDecoder(logits, self.gaussian_variance)
+        elif self.dataset in {'mnist', 'omniglot'}:
             return Bernoulli(logits=logits)
         elif self.dataset in {'stacked_mnist', 'cifar10', 'celeba_64', 'celeba_256', 'imagenet_32', 'imagenet_64', 'ffhq',
                               'lsun_bedroom_128', 'lsun_bedroom_256', 'lsun_church_64', 'lsun_church_128'}:

@@ -243,20 +243,14 @@ def _data_transforms_cifar10(args):
 
 
 def _data_transforms_mnist(args):
-    """Get data transforms for cifar10."""
-    train_transform = transforms.Compose([
+    """Pad to the model's input size and preserve grayscale in Gaussian mode."""
+    steps = [
         transforms.Pad(padding=2),
         transforms.ToTensor(),
-        Binarize(),
-    ])
-
-    valid_transform = transforms.Compose([
-        transforms.Pad(padding=2),
-        transforms.ToTensor(),
-        Binarize(),
-    ])
-
-    return train_transform, valid_transform
+    ]
+    if getattr(args, 'image_likelihood', 'dataset_default') != 'gaussian_fixed':
+        steps.append(Binarize())
+    return transforms.Compose(steps), transforms.Compose(steps)
 
 
 def _data_transforms_stacked_mnist(args):

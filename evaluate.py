@@ -81,15 +81,13 @@ def main(eval_args):
             logging.info('Using the training data for eval.')
             valid_queue = train_queue
 
-        # get number of bits
-        num_output = utils.num_output(args.dataset)
-        bpd_coeff = 1. / np.log(2.) / num_output
-
         valid_neg_log_p, valid_nelbo = test(valid_queue, model, num_samples=eval_args.num_iw_samples, args=args, logging=logging)
         logging.info('final valid nelbo %f', valid_nelbo)
         logging.info('final valid neg log p %f', valid_neg_log_p)
-        logging.info('final valid nelbo in bpd %f', valid_nelbo * bpd_coeff)
-        logging.info('final valid neg log p in bpd %f', valid_neg_log_p * bpd_coeff)
+        if model.image_likelihood != 'gaussian_fixed':
+            bpd_coeff = 1. / np.log(2.) / utils.num_output(args.dataset)
+            logging.info('final valid nelbo in bpd %f', valid_nelbo * bpd_coeff)
+            logging.info('final valid neg log p in bpd %f', valid_neg_log_p * bpd_coeff)
     elif eval_args.eval_mode == 'evaluate_fid':
         bn_eval_mode = not eval_args.readjust_bn
         set_bn(model, bn_eval_mode, num_samples=2, t=eval_args.temp, iter=500)
@@ -111,9 +109,7 @@ def main(eval_args):
                 start = time()
                 with autocast():
                     logits = model.sample(num_samples, eval_args.temp)
-                output = model.decoder_output(logits)
-                output_img = output.mean if isinstance(output, torch.distributions.bernoulli.Bernoulli) \
-                    else output.sample()
+                output_img = model.image_from_logits(logits)
                 torch.cuda.synchronize()
                 end = time()
                 logging.info('sampling time per batch: %0.3f sec', (end - start))

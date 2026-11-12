@@ -232,6 +232,30 @@ class Gamma:
             self.shape * (gamma_dist.rate / self.rate - 1.)
 
 
+class FixedGaussianDecoder:
+    """Independent Gaussian pixel densities in the original [0, 1] intensity units."""
+
+    def __init__(self, logits, variance):
+        if logits.dtype in (torch.float16, torch.bfloat16):
+            logits = logits.float()
+        self.loc = torch.sigmoid(logits)
+        self.scale = math.sqrt(variance)
+        self.log_normalizer = 0.5 * (math.log(2. * math.pi) + math.log(variance))
+
+    def log_prob(self, samples):
+        standardized = (samples - self.loc) / self.scale
+        return -0.5 * standardized.square() - self.log_normalizer
+
+    def mean(self):
+        return self.loc
+
+    @torch.no_grad()
+    def sample(self, t=1.):
+        # Explicit noisy draws only. Image rendering/export uses mean(), not this method.
+        # t applies to the latent prior; retain the legacy clipped draw API here.
+        return (self.loc + self.scale * torch.randn_like(self.loc)).clamp(0., 1.)
+
+
 class NormalDecoder:
     def __init__(self, param, num_bits=8):
         B, C, H, W = param.size()
