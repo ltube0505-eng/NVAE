@@ -13,8 +13,9 @@ existing vanilla path with:
 
 No additional prior flag is needed. Only the single-scale, single-group Poisson
 model gets the learnable prior. Hierarchical models and Normal latents retain
-their previous priors. Identity STE (`dz/drate = 1`) and the uncapped
-`rate = exp(log_rate)` parameterization are unchanged.
+their previous prior structure. All Poisson priors and posteriors now use the
+reference `soft_clamp5`: `rate = exp(5 * tanh(raw_log_rate / 5))`.
+Identity STE (`dz/drate = 1`) is unchanged; no rate=30 hard cap is restored.
 
 ## Prior and initialization
 
@@ -24,7 +25,7 @@ Each latent position has its own unconditional prior rate; these parameters are
 shared across images, not across spatial positions. The prior is
 
 ```text
-p(z) = product_{c,h,w} Poisson(z[c,h,w]; exp(prior_log_rate[0,c,h,w]))
+p(z) = product_{c,h,w} Poisson(z[c,h,w]; exp(5 * tanh(prior_log_rate[0,c,h,w] / 5)))
 ```
 
 Every log-rate starts at exactly zero, so every initial rate is exactly one.
@@ -35,8 +36,14 @@ is not the Poisson rate and is not used to decode in the vanilla path.
 Both `forward()` (analytic KL and sampled log-p) and `sample()` use `_prior0()`.
 The training optimizer already receives `model.parameters()`, so it updates the
 new parameter without a separate optimizer. For each log-rate `a`,
-`d KL(Poisson(q_rate) || Poisson(exp(a))) / da = exp(a) - q_rate`.
+`p_rate = exp(5*tanh(a/5))` and
+`d KL(Poisson(q_rate) || Poisson(p_rate)) / da = (p_rate - q_rate) * (1 - tanh(a/5)^2)`.
 Poisson sampling temperature behavior is unchanged from the base branch.
+
+The soft-cap adds no parameters or command-line flags. Existing learnable-prior
+checkpoint shapes still load, but nonzero raw values now define different rates;
+resuming or evaluating an uncapped checkpoint uses the new parameterization.
+Start a fresh run for a controlled comparison.
 
 New checkpoints include `prior_log_rate` and reload with the same architecture.
 An old fixed-prior vanilla checkpoint lacks that parameter, so it is not a

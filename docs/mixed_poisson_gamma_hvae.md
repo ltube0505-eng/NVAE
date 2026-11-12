@@ -72,8 +72,8 @@ $$
 - 验证和生成：精确 `torch.poisson` 采样。
 - 条件 KL：始终使用解析式。
 
-Poisson rate 直接使用 `exp(raw_log_rate)`，没有 `5*tanh(a/5)` 软截断或 rate=30 硬截断，
-所以 STE 对 raw log-rate 的导数为 rate。显式 `relaxed` 模式仍使用自适应 CTS；
+Poisson rate 使用 `exp(5*tanh(raw_log_rate/5))`，恢复参考实现的 soft-cap，但不恢复 rate=30 硬截断，
+所以 STE 对 raw log-rate 的导数为 `rate * (1 - tanh(raw_log_rate/5)^2)`。显式 `relaxed` 模式仍使用自适应 CTS；
 温度与尾项容差不影响 STE。完整公式与旧 checkpoint 兼容说明见
 [全 Poisson 文档](all_poisson_gradient_estimators.md#自适应-cts-与移除硬截断)。
 
