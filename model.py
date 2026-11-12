@@ -587,6 +587,11 @@ class AutoEncoder(nn.Module):
 
         logits = self.image_conditional(s)
 
+        # Observe the actual posterior rates without retaining an autograd graph.
+        rate_monitor = getattr(self, 'posterior_rate_monitor', None)
+        if self.training and rate_monitor is not None and rate_monitor.active:
+            rate_monitor.record(all_q)
+
         # compute kl
         kl_all = []
         kl_diag = []
@@ -709,4 +714,5 @@ class AutoEncoder(nn.Module):
                 loss += torch.max(torch.abs(l.weight))
 
         return loss
+
 
