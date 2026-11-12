@@ -101,7 +101,7 @@ def test_adaptive_cts_config_reaches_posterior_and_prior_with_legacy_args():
     param = torch.full((1, 4, 2, 2), 8.)
     q = model._latent_from_param(0, param)
     p = model._fixed_prior(0, param[:, :2])
-    assert torch.allclose(q.rate, torch.exp(param[:, :2]))
+    assert torch.allclose(q.rate, torch.exp(5. * torch.tanh(param[:, :2] / 5.)))
     assert torch.equal(p.rate, torch.ones_like(p.rate))
     assert q.cts_tail_tolerance == p.cts_tail_tolerance == 1e-4
     model.poisson_cts_tail_tolerance = 1e-6
@@ -258,7 +258,7 @@ def test_vanilla_learned_prior_used_by_forward_sampling_and_checkpoint():
         model.prior_log_rate.copy_(torch.linspace(-0.5, 1., model.prior_log_rate.numel())
                                    .reshape_as(model.prior_log_rate))
     reference = torch.zeros([2] + model.z0_size)
-    expected_rate = model.prior_log_rate.exp().expand_as(reference)
+    expected_rate = (5. * torch.tanh(model.prior_log_rate / 5.)).exp().expand_as(reference)
     # Keep posterior samples deterministic so log_p can be checked independently.
     z = torch.ones_like(reference)
     with patch.object(model, '_sample_latent', return_value=(z, None)):
@@ -284,3 +284,19 @@ def test_other_topologies_and_normal_prior_remain_fixed():
         assert torch.equal(model._prior0(reference).log_p(reference),
                            model._fixed_prior(0, reference).log_p(reference))
 
+
+
+@pytest.mark.parametrize('raw_prior', [-8., -1., 2., 8.])
+def test_learned_prior_soft_cap_kl_chain_rule(raw_prior):
+    model = _vanilla_model()
+    with torch.no_grad():
+        model.prior_log_rate.fill_(raw_prior)
+    reference = torch.zeros([2] + model.z0_size)
+    q = Poisson(torch.full_like(reference, 0.7))
+    p = model._prior0(reference)
+    p_expected = (5. * torch.tanh(model.prior_log_rate / 5.)).exp()
+    assert torch.equal(p.rate, p_expected.expand_as(reference))
+    q.kl(p).sum(dim=[1, 2, 3]).mean().backward()
+    expected = ((p.rate - q.rate).mean(dim=0, keepdim=True)
+                * (1. - torch.tanh(model.prior_log_rate / 5.).pow(2)))
+    assert torch.allclose(model.prior_log_rate.grad, expected, atol=1e-6)

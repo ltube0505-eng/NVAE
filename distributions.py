@@ -77,13 +77,13 @@ class Poisson:
             warnings.warn('max_count and max_rate are deprecated and ignored; '
                           'CTS is adaptive and Poisson rates have no hard cap.',
                           DeprecationWarning, stacklevel=2)
-        # Unbounded log-rate parameterization: lambda = exp(a), d lambda/da = lambda.
-        # Fail explicitly on floating-point overflow/underflow; do not add a cap.
-        self.log_rate = log_rate
-        self.rate = torch.exp(log_rate)
-        if not bool((torch.isfinite(self.rate) & (self.rate > 0.)).all().item()):
-            raise ValueError('Poisson exp(log_rate) must be finite and positive; '
-                             'check log_rate for overflow or underflow.')
+        if not bool(torch.isfinite(log_rate).all().item()):
+            raise ValueError('Poisson raw log_rate must be finite.')
+        # Match the reference soft-cap, without restoring its rate=30 hard cap.
+        # lambda = exp(5*tanh(a/5)); d lambda/da = lambda*sech^2(a/5).
+        self.rate = torch.exp(soft_clamp5(log_rate))
+        # Keep density, KL and O-BBVI proposals consistent with the actual rate.
+        self.log_rate = torch.log(self.rate)
         self.relaxation_temperature = relaxation_temperature
         self.cts_tail_tolerance = cts_tail_tolerance
         self.last_cts_num_terms = None

@@ -46,18 +46,27 @@ STE 不计算到达时间，不依赖温度或尾项容差；旧的 `sample(rela
 
 ### 自适应 CTS 与移除硬截断
 
-本分支进一步移除 Poisson 的 `5*tanh(a/5)` 软截断，直接使用
-\(\lambda=\exp(a)\)、\(\log\lambda=a\)。因此
+本分支恢复参考分支 `feature/all-poisson-gradient-estimators` 的
+`soft_clamp5`，对先验和后验的 raw 参数 \(a\) 统一使用
 
 \[
-\frac{\partial\lambda}{\partial a}=\lambda,\qquad
-\frac{\partial z_{\rm STE}}{\partial a}=\lambda.
+\lambda=\exp(5\tanh(a/5)),\qquad \log\lambda=\log(\lambda),
+\]
+\[
+\frac{\partial\lambda}{\partial a}
+=\frac{\partial z_{\rm STE}}{\partial a}
+=\lambda\bigl(1-\tanh^2(a/5)\bigr).
 \]
 
-这作用于所有 Poisson 后验、条件先验及所有估计器；固定零 log-rate 先验仍为
-Poisson(1)。Normal/Gamma 的参数化不变，解析 Poisson KL 仍正常反传。
-rate 没有硬上限或软上限；若指数运算溢出、下溢到零或产生非有限值，显式报错，
-不偷偷截断。有限 rate 也可能产生很大的 KL 或梯度，需要通过训练监控判断稳定性。
+这只恢复 soft-cap，不恢复参考分支另有的 rate=30 硬截断，也不恢复其固定
+64 项计数截断。数学上 \(e^{-5}<\lambda<e^5\)，浮点饱和时可能达到端点，
+约为 0.00674 和 148.41。有限但很大的 raw 值不会导致指数上溢或下溢到零；
+非有限 raw 值仍显式报错。极端 raw 值处 tanh 也可能在浮点精度下饱和，
+使 raw 梯度为零。采样计数本身仍无上限。
+
+所有 Poisson 后验、条件先验、可学习先验及估计器共用该变换；固定零 raw
+先验仍为 Poisson(1)。Normal/Gamma 参数化不变。密度、解析 KL 和 O-BBVI
+proposal 均使用变换后的 rate/log-rate。
 
 下面的自适应 CTS 仅用于显式 `relaxed` 模式。
 CTS 不再固定展开 64 项。每次采样取当前 Poisson rate 张量的最大值
@@ -92,9 +101,9 @@ M 是按当前参数选择的初始预算，不是硬计数上限。`H >= 1` 保
 
 旧命令行 `--poisson_max_count`、`--poisson_max_rate` 仍可解析，但已弃用且忽略；
 直接调用 `Poisson(..., max_count=..., max_rate=...)` 也只保留兼容入口。
-旧 checkpoint 缺少新字段时默认采用 `1e-4`，权重形状不变，但直接指数参数化
-会改变非零 raw log-rate 对应的分布；继续训练也会采用新的 STE 梯度。不能将
-旧 checkpoint 的本分支评估结果当作旧参数化下的复现结果。
+旧 checkpoint 缺少容差字段时默认采用 `1e-4`。soft-cap 不增加参数或命令行开关，
+权重形状不变，但非零 raw 值对应的 rate 和 raw 梯度会改变；从无 soft-cap 的
+checkpoint 续训或评估时会直接使用新参数化，不能视为原分布的复现。建议新开实验比较。
 在 `relaxed` 模式，较大的 rate、温度或更严格的容差会增加采样项数、显存和计算量；规划和停止检查
 还会触发设备同步。没有另外设置隐藏的最大项数。
 
@@ -230,7 +239,7 @@ OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python -m pytest -q
 自适应 CTS 的回归测试另覆盖：超过 30 的 rate 梯度和密度一致性、超过 64 的
 硬计数及 Poisson 均值/方差、项数对 rate/温度/容差的响应、软计数期望尾界、
 强制追加采样时的到达连续性和梯度、STE 精确整数前向及任意上游梯度的恒等回传、
-raw 空间的指数链式梯度、STE 绕过 CTS 且不依赖 CTS 设置、
+raw 空间含 soft-cap 导数的链式梯度、STE 绕过 CTS 且不依赖 CTS 设置、
 旧参数兼容、空张量和非法参数，以及模型后验/先验的新参数传递。
 
 
