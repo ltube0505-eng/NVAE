@@ -397,7 +397,7 @@ distribution while retaining the NVAE network hierarchy. See
 `--latent_distribution poisson` makes every latent group Poisson. A unified
 interface selects continuous relaxation, REINFORCE, O-BBVI/DMIS, or the
 identity straight-through estimator (`dz/drate = 1`). Poisson rates use
-`exp(raw_log_rate)` without soft or hard caps. See the [mathematical definition,
+`exp(5 * tanh(raw_log_rate / 5))`, using the reference soft-cap without a rate=30 hard cap. See the [mathematical definition,
 commands, implementation notes, and tests](docs/all_poisson_gradient_estimators.md).
 
 

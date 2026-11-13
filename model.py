@@ -188,6 +188,12 @@ class AutoEncoder(nn.Module):
                            self.input_size // spatial_scaling)
         self.prior_ftr0 = nn.Parameter(torch.rand(size=prior_ftr0_size), requires_grad=True)
         self.z0_size = [self.num_latent_per_group, self.input_size // spatial_scaling, self.input_size // spatial_scaling]
+        # The vanilla Poisson VAE learns one unconditional rate per (c, h, w).
+        # Zero log-rates preserve the base branch's exact Poisson(1) prior at init.
+        if self.vanilla_vae and self.latent_distribution == 'poisson':
+            self.prior_log_rate = nn.Parameter(torch.zeros([1] + self.z0_size))
+        else:
+            self.register_parameter('prior_log_rate', None)
 
         self.stem = self.init_stem()
         self.pre_process, mult = self.init_pre_process(mult=1)
@@ -313,7 +319,7 @@ class AutoEncoder(nn.Module):
                     num_c1 = int(self.num_channels_enc * mult)
                     num_c2 = 8 * self.num_latent_per_group  # use 8x features
                     nf_cells.append(PairedCellAR(self.num_latent_per_group, num_c1, num_c2, arch))
-                if not (s == 0 and g == 0):  # The first group uses a fixed family-specific prior.
+                if not (s == 0 and g == 0):  # The first group uses an unconditional prior.
                     num_c = int(self.num_channels_dec * mult)
                     cell = nn.Sequential(
                         nn.ELU(),
@@ -404,6 +410,14 @@ class AutoEncoder(nn.Module):
                            relaxation_temperature=self.poisson_relaxation_temperature,
                            cts_tail_tolerance=self.poisson_cts_tail_tolerance)
         return Gamma(first, second, temp=temp)
+
+    def _prior0(self, reference, temp=1.):
+        """Use the same unconditional prior for the ELBO and generation."""
+        if self.prior_log_rate is not None:
+            return Poisson(self.prior_log_rate.expand(reference.size(0), -1, -1, -1),
+                           relaxation_temperature=self.poisson_relaxation_temperature,
+                           cts_tail_tolerance=self.poisson_cts_tail_tolerance)
+        return self._fixed_prior(0, reference, temp=temp)
 
     def _fixed_prior(self, group_index, reference, temp=1.):
         zeros = torch.zeros_like(reference)
@@ -520,7 +534,7 @@ class AutoEncoder(nn.Module):
         s = 0
 
         # prior for z0
-        dist = self._fixed_prior(0, z)
+        dist = self._prior0(z)
         log_p_conv = dist.log_p(z)
         all_p = [dist]
         all_log_p = [log_p_conv]
@@ -573,6 +587,11 @@ class AutoEncoder(nn.Module):
 
         logits = self.image_conditional(s)
 
+        # Observe the actual posterior rates without retaining an autograd graph.
+        rate_monitor = getattr(self, 'posterior_rate_monitor', None)
+        if self.training and rate_monitor is not None and rate_monitor.active:
+            rate_monitor.record(all_q)
+
         # compute kl
         kl_all = []
         kl_diag = []
@@ -606,7 +625,7 @@ class AutoEncoder(nn.Module):
         scale_ind = 0
         z0_size = [num_samples] + self.z0_size
         reference = torch.zeros(z0_size, device=self.prior_ftr0.device)
-        dist = self._fixed_prior(0, reference, temp=t)
+        dist = self._prior0(reference, temp=t)
         z, _ = self._sample_latent(dist, training_sample=False)
 
         idx_dec = 0
@@ -695,4 +714,5 @@ class AutoEncoder(nn.Module):
                 loss += torch.max(torch.abs(l.weight))
 
         return loss
+
 
