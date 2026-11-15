@@ -87,6 +87,19 @@ class Conv2D(nn.Conv2d):
         self.init_done = False
         self.weight_normalized = self.normalize_weight()
 
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        super(Conv2D, self)._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs)
+        # res_elu uses one-time data-dependent initialization. Loaded parameters
+        # must survive the first forward after resume/evaluation unchanged.
+        init_keys = ['weight', 'log_weight_norm']
+        if self.bias is not None:
+            init_keys.append('bias')
+        if self.data_init and all(prefix + key in state_dict for key in init_keys):
+            self.init_done = True
+
     def forward(self, x):
         """
         Args:

@@ -14,6 +14,46 @@ likelihood-based generative models on several image datasets.
     <img src="img/celebahq.png" width="800">
 </p>
 
+## Poisson vanilla learnable prior without BatchNorm
+
+This branch defaults to the existing `--arch_instance res_elu` preset in both
+`train.py` and `train_poisson_posterior_rate.py`. With this preset, the complete
+autoencoder contains no BatchNorm/SyncBatchNorm layers, no BN affine parameters,
+and no running mean/variance buffers. Startup should print `len bn: 0`, and the
+BN regularization loss is zero.
+
+This reuses the repository's existing BN-free architecture. Compared with the
+base branch's `res_mbconv` default, it also replaces Swish/MBConv blocks with ELU
+convolution blocks; it is **not an otherwise identical MBConv BN ablation**.
+Convolutional weight normalization and spectral regularization remain enabled
+according to their existing settings. `res_elu` also retains its one-time
+data-dependent convolution initialization (using the first minibatch, with
+distributed statistics); this is not a normalization operation on every batch.
+Loading saved convolution parameters skips that initialization so resumed or
+evaluated models do not overwrite their learned weights on the next forward.
+
+For the Poisson vanilla learnable-prior experiment, use these settings with your
+existing data, optimizer, and model-size arguments:
+
+```bash
+python train_poisson_posterior_rate.py \
+  --arch_instance res_elu \
+  --latent_distribution poisson --poisson_gradient_estimator straight_through \
+  --num_latent_scales 1 --num_groups_per_scale 1 --num_nf 0 \
+  --data /root/autodl-tmp/datasets/mnist --dataset mnist \
+  --root /root/autodl-tmp/nvae-checkpoints \
+  --save mnist_poisson_vanilla_learnable_prior_no_batchnorm
+```
+
+Use a fresh run directory for this experiment. Replace any explicit
+`--arch_instance res_mbconv` in older commands with `--arch_instance res_elu`;
+explicit architecture arguments still override the default. Resume only a
+checkpoint trained with the same architecture. In particular, `--rate-resume`
+restores the saved architecture, so it does not convert a BN checkpoint into a
+BN-free model. Evaluation also uses the checkpoint's saved architecture and does
+not need `--readjust_bn` for `res_elu`. The upstream reproduction commands below
+assumed `res_mbconv`; pass that explicitly to reproduce those BN-based models.
+
 ## Requirements
 NVAE is built in Python 3.7 using PyTorch 1.6.0. Use the following command to install the requirements:
 ```
