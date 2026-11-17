@@ -8,14 +8,14 @@ from distributions import Poisson
 
 
 def _raw_log_rate(rate):
-    return 5. * math.atanh(math.log(rate) / 5.)
+    return math.log(rate)
 
 
 def test_rate_above_old_cap_has_nonzero_gradient_and_consistent_density():
     raw = torch.tensor([5., 8.], dtype=torch.float64, requires_grad=True)
     q = Poisson(raw)
     assert (q.rate > 30.).all()
-    expected = torch.exp(5. * torch.tanh(raw / 5.))
+    expected = torch.exp(raw)
     assert torch.allclose(q.rate, expected)
     counts = torch.tensor([40., 100.], dtype=torch.float64)
     assert torch.allclose(q.log_p(counts), torch.distributions.Poisson(q.rate).log_prob(counts))
@@ -23,7 +23,7 @@ def test_rate_above_old_cap_has_nonzero_gradient_and_consistent_density():
     assert torch.allclose(q.kl(p), torch.distributions.kl_divergence(
         torch.distributions.Poisson(q.rate), torch.distributions.Poisson(p.rate)))
     q.rate.sum().backward()
-    assert torch.allclose(raw.grad, expected * (1. - torch.tanh(raw / 5.).pow(2)))
+    assert torch.allclose(raw.grad, expected)
 
 
 def test_legacy_caps_are_ignored():
@@ -94,7 +94,7 @@ def test_st_exact_forward_identity_rate_gradient_and_raw_chain_rule(legacy_alias
     rate_grad = torch.autograd.grad(loss, q.rate, retain_graph=True)[0]
     raw_grad = torch.autograd.grad(loss, raw)[0]
     assert torch.equal(rate_grad, weights)
-    assert torch.allclose(raw_grad, weights * q.rate.detach() * (1. - torch.tanh(raw.detach() / 5.).pow(2)))
+    assert torch.allclose(raw_grad, weights * q.rate.detach())
     assert q.last_cts_num_terms is None and q.last_cts_horizon is None
 
 
@@ -178,19 +178,20 @@ def test_empty_rate_tensor():
 
 
 @pytest.mark.parametrize('dtype', [torch.float32, torch.float64])
-def test_soft_cap_prevents_overflow_and_underflow_for_finite_raw(dtype):
-    raw = torch.tensor([-1e6, -110., 0., 100., 1e6], dtype=dtype, requires_grad=True)
+def test_uncapped_rate_and_gradient_beyond_old_soft_cap(dtype):
+    raw = torch.tensor([-12., -6., 0., 6., 12.], dtype=dtype, requires_grad=True)
     q = Poisson(raw)
     assert torch.isfinite(q.rate).all() and (q.rate > 0.).all()
-    assert torch.all(q.rate >= torch.exp(torch.tensor(-5., dtype=dtype)))
-    assert torch.all(q.rate <= torch.exp(torch.tensor(5., dtype=dtype)))
+    assert torch.equal(q.rate, torch.exp(raw))
+    assert q.rate[0] < torch.exp(torch.tensor(-5., dtype=dtype))
+    assert q.rate[-1] > torch.exp(torch.tensor(5., dtype=dtype))
     assert q.rate[2].item() == 1.
-    assert torch.equal(q.log_rate, q.rate.log())
+    assert torch.equal(q.log_rate, raw)
     q.rate.sum().backward()
-    assert torch.isfinite(raw.grad).all()
+    assert torch.equal(raw.grad, q.rate.detach())
 
 
-def test_soft_cap_density_gradients_match_finite_differences():
+def test_uncapped_density_gradients_match_finite_differences():
     counts = torch.tensor([0., 2., 30.], dtype=torch.float64)
     def objective(q_raw, p_raw):
         q, p = Poisson(q_raw), Poisson(p_raw)

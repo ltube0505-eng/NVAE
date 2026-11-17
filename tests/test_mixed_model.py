@@ -101,7 +101,7 @@ def test_adaptive_cts_config_reaches_posterior_and_prior_with_legacy_args():
     param = torch.full((1, 4, 2, 2), 8.)
     q = model._latent_from_param(0, param)
     p = model._fixed_prior(0, param[:, :2])
-    assert torch.allclose(q.rate, torch.exp(5. * torch.tanh(param[:, :2] / 5.)))
+    assert torch.allclose(q.rate, torch.exp(param[:, :2]))
     assert torch.equal(p.rate, torch.ones_like(p.rate))
     assert q.cts_tail_tolerance == p.cts_tail_tolerance == 1e-4
     model.poisson_cts_tail_tolerance = 1e-6
@@ -200,8 +200,7 @@ def test_vanilla_forward_prior_gradient_and_optimizer_update():
     assert torch.allclose(kl_all[0], expected_kl)
     assert torch.isfinite(log_p).all()
     kl_all[0].mean().backward()
-    expected_grad = ((prior.rate.detach() - q.rate.detach()).mean(dim=0, keepdim=True)
-                     * (1. - torch.tanh(model.prior_log_rate.detach() / 5.).pow(2)))
+    expected_grad = (prior.rate.detach() - q.rate.detach()).mean(dim=0, keepdim=True)
     assert torch.allclose(model.prior_log_rate.grad, expected_grad)
     before = model.prior_log_rate.detach().clone()
     optimizer.step()
@@ -222,16 +221,14 @@ def test_vanilla_residual_posterior_forward_and_shared_prior_gradient(res_dist):
         _, _, _, kl_all, _ = model(torch.rand(2, 1, 32, 32))
     q = sampler.call_args[0][0]
     raw_q = model.prior_log_rate + delta
-    expected_rate = (5. * torch.tanh(raw_q / 5.)).exp()
+    expected_rate = raw_q.exp()
     assert torch.allclose(q.rate, expected_rate)
     p = model._prior0(delta)
     kl_all[0].mean().backward()
-    expected_delta_grad = (q.rate * (q.log_rate - p.log_rate)
-                           * (1. - torch.tanh(raw_q / 5.).pow(2)) / shape[0])
+    expected_delta_grad = q.rate * (q.log_rate - p.log_rate) / shape[0]
     assert torch.allclose(delta.grad, expected_delta_grad, atol=1e-6)
-    expected_prior_grad = expected_delta_grad.sum(dim=0, keepdim=True) + (
-        (p.rate - q.rate).mean(dim=0, keepdim=True)
-        * (1. - torch.tanh(model.prior_log_rate / 5.).pow(2)))
+    expected_prior_grad = (expected_delta_grad.sum(dim=0, keepdim=True)
+                           + (p.rate - q.rate).mean(dim=0, keepdim=True))
     assert torch.allclose(model.prior_log_rate.grad, expected_prior_grad, atol=1e-6)
     # A zero residual recovers exactly the same prior distribution.
     zero_q = model._latent_from_param(0, torch.zeros_like(param))
@@ -245,7 +242,7 @@ def test_vanilla_learned_prior_used_by_forward_sampling_and_checkpoint():
         model.prior_log_rate.copy_(torch.linspace(-0.5, 1., model.prior_log_rate.numel())
                                    .reshape_as(model.prior_log_rate))
     reference = torch.zeros([2] + model.z0_size)
-    expected_rate = (5. * torch.tanh(model.prior_log_rate / 5.)).exp().expand_as(reference)
+    expected_rate = model.prior_log_rate.exp().expand_as(reference)
     # Keep posterior samples deterministic so log_p can be checked independently.
     z = torch.ones_like(reference)
     with patch.object(model, '_sample_latent', return_value=(z, None)):
@@ -274,16 +271,15 @@ def test_other_topologies_and_normal_prior_remain_fixed():
 
 
 @pytest.mark.parametrize('raw_prior', [-8., -1., 2., 8.])
-def test_learned_prior_soft_cap_kl_chain_rule(raw_prior):
+def test_learned_prior_uncapped_kl_chain_rule(raw_prior):
     model = _vanilla_model()
     with torch.no_grad():
         model.prior_log_rate.fill_(raw_prior)
     reference = torch.zeros([2] + model.z0_size)
     q = Poisson(torch.full_like(reference, 0.7))
     p = model._prior0(reference)
-    p_expected = (5. * torch.tanh(model.prior_log_rate / 5.)).exp()
+    p_expected = model.prior_log_rate.exp()
     assert torch.equal(p.rate, p_expected.expand_as(reference))
     q.kl(p).sum(dim=[1, 2, 3]).mean().backward()
-    expected = ((p.rate - q.rate).mean(dim=0, keepdim=True)
-                * (1. - torch.tanh(model.prior_log_rate / 5.).pow(2)))
+    expected = (p.rate - q.rate).mean(dim=0, keepdim=True)
     assert torch.allclose(model.prior_log_rate.grad, expected, atol=1e-6)

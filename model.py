@@ -399,7 +399,7 @@ class AutoEncoder(nn.Module):
         first, second = torch.chunk(param, 2, dim=1)
         if group_index == 0 and self.prior_log_rate is not None:
             # Vanilla Poisson: the encoder predicts a residual in raw log-rate
-            # space. Keep the shared prior differentiable and the soft-cap intact.
+            # space. Keep the shared prior differentiable; Poisson uses exp directly.
             first = first + self.prior_log_rate
         if residual_param is not None and self.res_dist:
             residual_first, residual_second = torch.chunk(residual_param, 2, dim=1)
