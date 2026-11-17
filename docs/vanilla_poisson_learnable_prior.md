@@ -1,6 +1,6 @@
 # Vanilla Poisson VAE with a learnable prior
 
-This branch extends `feature/poisson-identity-ste-no-soft-cap`. Select the
+This branch extends `feature/poisson-vanilla-learnable-prior-no-batchnorm`. Select the
 existing vanilla path with:
 
 ```bash
@@ -28,22 +28,41 @@ shared across images, not across spatial positions. The prior is
 p(z) = product_{c,h,w} Poisson(z[c,h,w]; exp(5 * tanh(prior_log_rate[0,c,h,w] / 5)))
 ```
 
-Every log-rate starts at exactly zero, so every initial rate is exactly one.
-**The initial prior distribution is exactly the base branch's Poisson(1).**
+Every element of `prior_log_rate` is initialized independently from
+`Uniform(-6, -2)`. These are raw parameters before the unchanged soft-cap;
+the actual prior rate is still `exp(5 * tanh(prior_log_rate / 5))`.
 The existing `prior_ftr0` random initialization is unchanged; that feature tensor
 is not the Poisson rate and is not used to decode in the vanilla path.
 
+The vanilla Poisson encoder predicts a residual `delta(x)`, using the same
+posterior head and its existing initialization:
+
+```text
+q_raw_log_rate(x) = prior_log_rate + delta(x)
+q_rate(x) = exp(5 * tanh(q_raw_log_rate(x) / 5))
+```
+
+This residual parameterization is always active for the vanilla Poisson model,
+including when `--res_dist` is omitted. That flag retains its existing meaning
+for hierarchical groups. A zero residual makes the posterior equal to the
+prior. Gradients flow through both `delta(x)` and `prior_log_rate`; the prior
+is not detached. Other latent configurations are unchanged.
+
 Both `forward()` (analytic KL and sampled log-p) and `sample()` use `_prior0()`.
 The training optimizer already receives `model.parameters()`, so it updates the
-new parameter without a separate optimizer. For each log-rate `a`,
+parameter without a separate optimizer. Holding the posterior rate fixed,
+for each raw prior log-rate `a`,
 `p_rate = exp(5*tanh(a/5))` and
 `d KL(Poisson(q_rate) || Poisson(p_rate)) / da = (p_rate - q_rate) * (1 - tanh(a/5)^2)`.
 Poisson sampling temperature behavior is unchanged from the base branch.
+With the residual posterior, the total prior gradient additionally includes
+the posterior's dependence on the shared `prior_log_rate`.
 
-The soft-cap adds no parameters or command-line flags. Existing learnable-prior
-checkpoint shapes still load, but nonzero raw values now define different rates;
-resuming or evaluating an uncapped checkpoint uses the new parameterization.
-Start a fresh run for a controlled comparison.
+No parameters or command-line flags are added by residual parameterization.
+Existing learnable-prior checkpoint shapes still load, and loading overwrites
+the random prior initialization. However, old encoder outputs are now interpreted
+as residuals, so their posterior distributions change. Start a fresh run for a
+controlled comparison.
 
 New checkpoints include `prior_log_rate` and reload with the same architecture.
 An old fixed-prior vanilla checkpoint lacks that parameter, so it is not a
@@ -81,8 +100,9 @@ This also gives **6 Cells on each side**, but now 3 normal + 3 down and
 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python -m pytest -q tests
 ```
 
-The vanilla tests cover initialization equality, Cell counts, the analytic prior
-gradient and an optimizer update, learned log-p during forward evaluation,
+The vanilla tests cover elementwise prior initialization bounds, Cell counts,
+residual posterior rates and gradients through both the encoder and shared prior,
+the analytic fixed-posterior prior gradient and an optimizer update, learned log-p during forward evaluation,
 generation with learned rates, strict state-dict roundtrip, and unchanged priors
 for other model configurations. Model CPU tests use `res_elu` and disable
 distributed data-dependent convolution initialization, as the existing tests do.

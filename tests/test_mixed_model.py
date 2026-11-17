@@ -177,9 +177,12 @@ def test_vanilla_topology_and_prior_initialization(blocks, cells):
     assert model.prior_log_rate.shape == (1, 2, 32 // 2 ** blocks, 32 // 2 ** blocks)
     reference = torch.zeros([3] + model.z0_size)
     prior = model._prior0(reference)
-    fixed = model._fixed_prior(0, reference)
-    assert torch.equal(prior.rate, fixed.rate)
-    assert torch.equal(prior.log_p(reference), fixed.log_p(reference))
+    raw_prior = model.prior_log_rate.detach()
+    assert ((raw_prior >= -6.) & (raw_prior <= -2.)).all()
+    assert raw_prior.unique().numel() > 1
+    expected = Poisson(raw_prior.expand_as(reference))
+    assert torch.equal(prior.rate, expected.rate)
+    assert torch.equal(prior.log_p(reference), expected.log_p(reference))
 
 
 def test_vanilla_forward_prior_gradient_and_optimizer_update():
@@ -192,15 +195,48 @@ def test_vanilla_forward_prior_gradient_and_optimizer_update():
     assert logits.shape == (2, 1, 32, 32)
     assert len(kl_all) == 1
     assert sampler.call_count == 1
-    # At initialization the analytic KL is q*log(q) + 1 - q.
-    expected_kl = (q.rate * q.log_rate + 1. - q.rate).sum(dim=[1, 2, 3])
+    prior = model._prior0(q.rate)
+    expected_kl = q.kl(prior).sum(dim=[1, 2, 3])
     assert torch.allclose(kl_all[0], expected_kl)
     assert torch.isfinite(log_p).all()
     kl_all[0].mean().backward()
-    expected_grad = (1. - q.rate.detach()).mean(dim=0, keepdim=True)
+    expected_grad = ((prior.rate.detach() - q.rate.detach()).mean(dim=0, keepdim=True)
+                     * (1. - torch.tanh(model.prior_log_rate.detach() / 5.).pow(2)))
     assert torch.allclose(model.prior_log_rate.grad, expected_grad)
+    before = model.prior_log_rate.detach().clone()
     optimizer.step()
-    assert (model.prior_log_rate > 0.).all()
+    assert (model.prior_log_rate > before).all()
+
+
+@pytest.mark.parametrize('res_dist', [False, True])
+def test_vanilla_residual_posterior_forward_and_shared_prior_gradient(res_dist):
+    model = _vanilla_model().train()
+    model.res_dist = res_dist
+    shape = [2] + model.z0_size
+    delta = torch.linspace(-0.7, 0.9, int(torch.tensor(shape).prod()))
+    delta = delta.reshape(shape).requires_grad_()
+    param = torch.cat([delta, torch.zeros_like(delta)], dim=1)
+    # Exercise the real forward path, including the default res_dist=False case.
+    with patch.object(model.enc_sampler[0], 'forward', return_value=param), \
+            patch.object(model, '_sample_latent', wraps=model._sample_latent) as sampler:
+        _, _, _, kl_all, _ = model(torch.rand(2, 1, 32, 32))
+    q = sampler.call_args[0][0]
+    raw_q = model.prior_log_rate + delta
+    expected_rate = (5. * torch.tanh(raw_q / 5.)).exp()
+    assert torch.allclose(q.rate, expected_rate)
+    p = model._prior0(delta)
+    kl_all[0].mean().backward()
+    expected_delta_grad = (q.rate * (q.log_rate - p.log_rate)
+                           * (1. - torch.tanh(raw_q / 5.).pow(2)) / shape[0])
+    assert torch.allclose(delta.grad, expected_delta_grad, atol=1e-6)
+    expected_prior_grad = expected_delta_grad.sum(dim=0, keepdim=True) + (
+        (p.rate - q.rate).mean(dim=0, keepdim=True)
+        * (1. - torch.tanh(model.prior_log_rate / 5.).pow(2)))
+    assert torch.allclose(model.prior_log_rate.grad, expected_prior_grad, atol=1e-6)
+    # A zero residual recovers exactly the same prior distribution.
+    zero_q = model._latent_from_param(0, torch.zeros_like(param))
+    assert torch.equal(zero_q.rate, p.rate)
+    assert torch.equal(zero_q.kl(p), torch.zeros_like(p.rate))
 
 
 def test_vanilla_learned_prior_used_by_forward_sampling_and_checkpoint():
