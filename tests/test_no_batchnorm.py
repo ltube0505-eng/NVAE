@@ -4,6 +4,7 @@ from unittest.mock import patch
 import pytest
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch.nn.modules.batchnorm import _BatchNorm
 
 from model import AutoEncoder
@@ -36,6 +37,40 @@ def single_rank_collectives():
     with patch.object(dist, 'get_world_size', return_value=1), \
             patch.object(dist, 'all_reduce') as reduce:
         yield reduce
+
+
+@pytest.mark.parametrize('bias', [False, True])
+def test_data_init_preserves_fp32_parameters_with_fp16_output(single_rank_collectives, bias):
+    torch.manual_seed(31)
+    layer = Conv2D(2, 3, 3, padding=1, bias=bias, data_init=True)
+    parameters = dict(layer.named_parameters())
+    optimizer = torch.optim.Adamax(layer.parameters(), lr=0.001)
+    conv2d = F.conv2d
+
+    def reduced_precision_conv(*args, **kwargs):
+        # Emulate autocast's FP16 convolution output on CPU. The initialization
+        # must not replace FP32 parameter storage with that output's dtype.
+        result = conv2d(*args, **kwargs)
+        return result.half() if not layer.init_done else result
+
+    with patch('neural_operations.F.conv2d', side_effect=reduced_precision_conv):
+        output = layer(torch.randn(4, 2, 8, 8))
+    assert layer.init_done
+    for name, parameter in layer.named_parameters():
+        assert parameter is parameters[name]
+        assert parameter.dtype == torch.float32, name
+        assert torch.isfinite(parameter).all(), name
+    assert single_rank_collectives.call_count == 2
+    for call in single_rank_collectives.call_args_list:
+        assert call[0][0].dtype == torch.float32
+    output.square().mean().backward()
+    for parameter in layer.parameters():
+        assert parameter.grad is not None
+        assert parameter.grad.dtype == torch.float32
+        assert torch.isfinite(parameter.grad).all()
+    before = layer.weight.detach().clone()
+    optimizer.step()
+    assert not torch.equal(layer.weight, before)
 
 
 @pytest.mark.parametrize('hierarchical', [False, True])
