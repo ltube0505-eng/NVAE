@@ -37,7 +37,7 @@ python train_poisson_posterior_rate.py \
   --num_preprocess_blocks 3 --num_preprocess_cells 2 \
   --num_postprocess_blocks 3 --num_postprocess_cells 2 \
   --num_cell_per_cond_enc 1 --num_cell_per_cond_dec 1 \
-  --arch_instance res_mbconv --batch_size 64 --epochs 200 \
+  --arch_instance res_elu --batch_size 64 --epochs 200 \
   --learning_rate 0.001 --learning_rate_min 0.0001 --fast_adamax \
   --kl_anneal_portion 0.3 --kl_const_coeff 0.0001 --kl_const_portion 0.0001 \
   --image_likelihood gaussian_fixed --gaussian_variance 0.01 \

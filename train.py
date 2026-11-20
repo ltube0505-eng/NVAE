@@ -401,7 +401,7 @@ def test_vae_fid(model, args, total_fid_samples):
 def init_processes(rank, size, fn, args):
     """ Initialize the distributed environment. """
     os.environ['MASTER_ADDR'] = args.master_address
-    os.environ['MASTER_PORT'] = '6020'
+    os.environ.setdefault('MASTER_PORT', '6020')
     torch.cuda.set_device(args.local_rank)
     dist.init_process_group(backend='nccl', init_method='env://', rank=rank, world_size=size)
     fn(args)
@@ -450,8 +450,8 @@ def main_cli(posterior_rate_only=False):
                         help='num of training epochs in which lr is warmed up')
     parser.add_argument('--fast_adamax', action='store_true', default=False,
                         help='This flag enables using our optimized adamax.')
-    parser.add_argument('--arch_instance', type=str, default='res_mbconv',
-                        help='path to the architecture instance')
+    parser.add_argument('--arch_instance', type=str, default='res_elu',
+                        help='architecture preset (default: res_elu, without BatchNorm)')
     # KL annealing
     parser.add_argument('--kl_anneal_portion', type=float, default=0.3,
                         help='The portions epochs that KL is annealed')
