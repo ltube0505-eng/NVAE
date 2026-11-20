@@ -79,11 +79,9 @@ class Poisson:
                           DeprecationWarning, stacklevel=2)
         if not bool(torch.isfinite(log_rate).all().item()):
             raise ValueError('Poisson raw log_rate must be finite.')
-        # Match the reference soft-cap, without restoring its rate=30 hard cap.
-        # lambda = exp(5*tanh(a/5)); d lambda/da = lambda*sech^2(a/5).
-        self.rate = torch.exp(soft_clamp5(log_rate))
-        # Keep density, KL and O-BBVI proposals consistent with the actual rate.
-        self.log_rate = torch.log(self.rate)
+        # Uncapped log-rate parameterization: lambda = exp(a), d lambda/da = lambda.
+        self.rate = torch.exp(log_rate)
+        self.log_rate = log_rate
         self.relaxation_temperature = relaxation_temperature
         self.cts_tail_tolerance = cts_tail_tolerance
         self.last_cts_num_terms = None

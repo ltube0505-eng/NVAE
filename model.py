@@ -199,9 +199,9 @@ class AutoEncoder(nn.Module):
         self.prior_ftr0 = nn.Parameter(torch.rand(size=prior_ftr0_size), requires_grad=True)
         self.z0_size = [self.num_latent_per_group, self.input_size // spatial_scaling, self.input_size // spatial_scaling]
         # The vanilla Poisson VAE learns one unconditional rate per (c, h, w).
-        # Zero log-rates preserve the base branch's exact Poisson(1) prior at init.
+        # Independently initialize each raw prior log-rate in [-6, -2].
         if self.vanilla_vae and self.latent_distribution == 'poisson':
-            self.prior_log_rate = nn.Parameter(torch.zeros([1] + self.z0_size))
+            self.prior_log_rate = nn.Parameter(torch.empty([1] + self.z0_size).uniform_(-6., -2.))
         else:
             self.register_parameter('prior_log_rate', None)
 
@@ -407,6 +407,10 @@ class AutoEncoder(nn.Module):
 
     def _latent_from_param(self, group_index, param, residual_param=None, temp=1.):
         first, second = torch.chunk(param, 2, dim=1)
+        if group_index == 0 and self.prior_log_rate is not None:
+            # Vanilla Poisson: the encoder predicts a residual in raw log-rate
+            # space. Keep the shared prior differentiable; Poisson uses exp directly.
+            first = first + self.prior_log_rate
         if residual_param is not None and self.res_dist:
             residual_first, residual_second = torch.chunk(residual_param, 2, dim=1)
             first = first + residual_first

@@ -87,6 +87,19 @@ class Conv2D(nn.Conv2d):
         self.init_done = False
         self.weight_normalized = self.normalize_weight()
 
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        super(Conv2D, self)._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs)
+        # res_elu uses one-time data-dependent initialization. Loaded parameters
+        # must survive the first forward after resume/evaluation unchanged.
+        init_keys = ['weight', 'log_weight_norm']
+        if self.bias is not None:
+            init_keys.append('bias')
+        if self.data_init and all(prefix + key in state_dict for key in init_keys):
+            self.init_done = True
+
     def forward(self, x):
         """
         Args:
@@ -98,7 +111,9 @@ class Conv2D(nn.Conv2d):
             with torch.no_grad():
                 weight = self.weight / (norm(self.weight, dim=[1, 2, 3]).view(-1, 1, 1, 1) + 1e-5)
                 bias = None
-                out = F.conv2d(x, weight, bias, self.stride, self.padding, self.dilation, self.groups)
+                # Autocast may produce FP16 output. Accumulate initialization
+                # statistics in FP32 and preserve the existing parameter dtype.
+                out = F.conv2d(x, weight, bias, self.stride, self.padding, self.dilation, self.groups).float()
                 mn = torch.mean(out, dim=[0, 2, 3])
                 st = 5 * torch.std(out, dim=[0, 2, 3])
 
@@ -107,8 +122,8 @@ class Conv2D(nn.Conv2d):
                 average_tensor(st, is_distributed=True)
 
                 if self.bias is not None:
-                    self.bias.data = - mn / (st + 1e-5)
-                self.log_weight_norm.data = -torch.log((st.view(-1, 1, 1, 1) + 1e-5))
+                    self.bias.copy_(-mn / (st + 1e-5))
+                self.log_weight_norm.copy_(-torch.log((st.view(-1, 1, 1, 1) + 1e-5)))
                 self.init_done = True
 
         self.weight_normalized = self.normalize_weight()
